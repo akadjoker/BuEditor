@@ -1,0 +1,23 @@
+{
+  "autosave_enabled": true,
+  "autosave_interval_ms": 1500,
+  "bugl_path": "bin/bugl",
+  "bytecode_output_path": "scripts/vm_cheatsheet.buc",
+  "console_visible": false,
+  "font_choice": "default",
+  "font_path": "",
+  "font_scale": 1.0,
+  "last_file_path": "scripts/vm_cheatsheet.bu",
+  "outline_side": "left",
+  "outline_visible": true,
+  "palette": "vscode_dark",
+  "runtime": {
+    "binary_path": "bin/bugl",
+    "profile_name": "bugl"
+  },
+  "workspace": {
+    "bytecode_output_path": "scripts/vm_cheatsheet.buc",
+    "entry_script": "scripts/vm_cheatsheet.bu",
+    "root_path": ""
+  }
+}

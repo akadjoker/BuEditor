@@ -1,0 +1,6 @@
+{
+  "name": "default",
+  "root_path": "",
+  "entry_script": "scripts/main.bu",
+  "runtime_profile": "bugl"
+}
