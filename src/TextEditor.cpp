@@ -1160,9 +1160,43 @@ void TextEditor::EnterCharacter(ImWchar aChar, bool aShift)
 				auto& line = mLines[coord.mLine];
 				auto cindex = GetCharacterIndexR(coord);
 
+				// Auto-close brackets/quotes
+				char closingChar = 0;
+				bool shouldSkipClose = false;
+				if (mAutoCloseBrackets && e == 1)
+				{
+					char ch = buf[0];
+					// Check if typing a closing char that already exists at cursor
+					if (ch == ')' || ch == ']' || ch == '}' || ch == '"' || ch == '\'')
+					{
+						if (cindex < (int)line.size() && line[cindex].mChar == ch)
+						{
+							// Skip over the existing closing character
+							shouldSkipClose = true;
+							SetCursorPosition(Coordinates(coord.mLine, GetCharacterColumn(coord.mLine, cindex + 1)), c);
+							added.mText = buf;
+							added.mEnd = GetSanitizedCursorCoordinates(c);
+							u.mOperations.push_back(added);
+							continue;
+						}
+					}
+					// Auto-insert closing counterpart
+					if (ch == '(') closingChar = ')';
+					else if (ch == '[') closingChar = ']';
+					else if (ch == '{') closingChar = '}';
+					else if (ch == '"') closingChar = '"';
+					else if (ch == '\'') closingChar = '\'';
+				}
+
 				for (auto p = buf; *p != '\0'; p++, ++cindex)
 					AddGlyphToLine(coord.mLine, cindex, Glyph(*p, PaletteIndex::Default));
 				added.mText = buf;
+
+				if (closingChar != 0)
+				{
+					// Insert closing character after cursor position
+					AddGlyphToLine(coord.mLine, cindex, Glyph(closingChar, PaletteIndex::Default));
+				}
 
 				SetCursorPosition(Coordinates(coord.mLine, GetCharacterColumn(coord.mLine, cindex)), c);
 			}
@@ -1716,6 +1750,59 @@ void TextEditor::RemoveCurrentLines()
 	AddUndo(u);
 }
 
+void TextEditor::DuplicateCurrentLines()
+{
+	assert(!mReadOnly);
+
+	UndoRecord u;
+	u.mBefore = mState;
+
+	// Collect all affected lines from all cursors
+	std::set<int> affectedLines;
+	for (int c = 0; c <= mState.mCurrentCursor; c++)
+	{
+		int startLine = mState.mCursors[c].GetSelectionStart().mLine;
+		int endLine = mState.mCursors[c].GetSelectionEnd().mLine;
+		if (Coordinates{ endLine, 0 } == mState.mCursors[c].GetSelectionEnd() && endLine != startLine)
+			endLine--; // don't include line when selection ends at its start
+		for (int l = startLine; l <= endLine; l++)
+			affectedLines.insert(l);
+	}
+
+	if (affectedLines.empty())
+		return;
+
+	int minLine = *affectedLines.begin();
+	int maxLine = *affectedLines.rbegin();
+	int lineCount = maxLine - minLine + 1;
+
+	// Duplicate all affected lines below themselves
+	for (int i = 0; i < lineCount; i++)
+	{
+		int srcLine = minLine + i;
+		auto& newLine = InsertLine(maxLine + 1 + i);
+		newLine = mLines[srcLine]; // copy glyphs
+	}
+
+	// Build undo record
+	Coordinates insertStart = { maxLine + 1, 0 };
+	Coordinates insertEnd = { maxLine + lineCount, GetLineMaxColumn(maxLine + lineCount) };
+	std::string insertedText = "\n" + GetText(insertStart, insertEnd);
+	u.mOperations.push_back({ insertedText, { maxLine, GetLineMaxColumn(maxLine) }, insertEnd, UndoOperationType::Add });
+
+	// Move cursors down to the duplicated lines
+	for (int c = 0; c <= mState.mCurrentCursor; c++)
+	{
+		mState.mCursors[c].mInteractiveStart.mLine += lineCount;
+		mState.mCursors[c].mInteractiveEnd.mLine += lineCount;
+	}
+
+	u.mAfter = mState;
+	AddUndo(u);
+
+	mFoldRegionsDirty = true;
+}
+
 float TextEditor::TextDistanceToLineStart(const Coordinates& aFrom, bool aSanitizeCoords) const
 {
 	if (aSanitizeCoords)
@@ -2194,6 +2281,8 @@ void TextEditor::HandleKeyboardInputs(bool aParentIsFocused)
 			Backspace(ctrl);
 		else if (!mReadOnly && !alt && ctrl && shift && !super && ImGui::IsKeyPressed(ImGuiKey_K))
 			RemoveCurrentLines();
+		else if (!mReadOnly && !alt && ctrl && shift && !super && ImGui::IsKeyPressed(ImGuiKey_D))
+			DuplicateCurrentLines();
 		else if (!mReadOnly && !alt && ctrl && !shift && !super && ImGui::IsKeyPressed(ImGuiKey_LeftBracket))
 			ChangeCurrentLinesIndentation(false);
 		else if (!mReadOnly && !alt && ctrl && !shift && !super && ImGui::IsKeyPressed(ImGuiKey_RightBracket))
@@ -2454,6 +2543,34 @@ void TextEditor::Render(bool aParentIsFocused)
 		auto drawList = ImGui::GetWindowDrawList();
 		float spaceSize = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, " ", nullptr, nullptr).x;
 
+		// Compute word under cursor for highlight-all-occurrences
+		std::string highlightWord;
+		{
+			auto cursorPos = GetSanitizedCursorCoordinates(mState.GetLastAddedCursorIndex());
+			auto wordStart = FindWordStart(cursorPos);
+			auto wordEnd = FindWordEnd(cursorPos);
+			if (wordStart < wordEnd && wordStart.mLine == wordEnd.mLine)
+			{
+				auto& wLine = mLines[wordStart.mLine];
+				int startIdx = GetCharacterIndexR(wordStart);
+				int endIdx = GetCharacterIndexR(wordEnd);
+				for (int i = startIdx; i < endIdx && i < (int)wLine.size(); i++)
+				{
+					char ch = wLine[i].mChar;
+					if (std::isalnum(static_cast<unsigned char>(ch)) || ch == '_')
+						highlightWord += ch;
+					else
+					{
+						highlightWord.clear();
+						break;
+					}
+				}
+				// Only highlight words with 2+ characters
+				if (highlightWord.size() < 2)
+					highlightWord.clear();
+			}
+		}
+
 		for (int visualLine = mFirstVisibleLine; visualLine <= mLastVisibleLine && visualLine < totalVisibleLines; visualLine++)
 		{
 			int lineNo = mVisibleLineNumbers[visualLine];
@@ -2521,6 +2638,41 @@ void TextEditor::Render(bool aParentIsFocused)
 						ImVec2{ lineStartScreenPos.x + mTextStart + rectStart, lineStartScreenPos.y },
 						ImVec2{ lineStartScreenPos.x + mTextStart + rectEnd, lineStartScreenPos.y + mCharAdvance.y },
 						mPalette[(int)PaletteIndex::Selection]);
+			}
+
+			// Draw highlight for all occurrences of word under cursor
+			if (!highlightWord.empty())
+			{
+				ImU32 hlColor = mPalette[(int)PaletteIndex::WordHighlight];
+				int hlLen = (int)highlightWord.size();
+				int ci = 0;
+				int col = 0;
+				while (ci + hlLen <= (int)line.size())
+				{
+					bool match = true;
+					for (int k = 0; k < hlLen && match; k++)
+					{
+						if (line[ci + k].mChar != highlightWord[k])
+							match = false;
+					}
+					// Check word boundaries
+					if (match)
+					{
+						bool leftBound = (ci == 0) || !(std::isalnum((unsigned char)line[ci - 1].mChar) || line[ci - 1].mChar == '_');
+						bool rightBound = (ci + hlLen >= (int)line.size()) || !(std::isalnum((unsigned char)line[ci + hlLen].mChar) || line[ci + hlLen].mChar == '_');
+						if (leftBound && rightBound)
+						{
+							float startX = col * mCharAdvance.x;
+							float endX = (col + hlLen) * mCharAdvance.x;
+							drawList->AddRectFilled(
+								ImVec2{ lineStartScreenPos.x + mTextStart + startX, lineStartScreenPos.y },
+								ImVec2{ lineStartScreenPos.x + mTextStart + endX, lineStartScreenPos.y + mCharAdvance.y },
+								hlColor);
+						}
+					}
+					ci++;
+					col++;
+				}
 			}
 
 			// Line numbers are drawn after the main loop as a fixed gutter overlay (see below)
@@ -3165,6 +3317,7 @@ const TextEditor::Palette& TextEditor::GetDarkPalette()
 			0xffffff0a, // Current line fill
 			0xffffff06, // Current line fill (inactive)
 			0xffffff15, // Current line edge
+			0xffffff20, // Word highlight
 		} };
 	return p;
 }
@@ -3194,6 +3347,7 @@ const TextEditor::Palette& TextEditor::GetMarianaPalette()
 			0xffffff0a, // Current line fill
 			0xffffff06, // Current line fill (inactive)
 			0xffffff15, // Current line edge
+			0xffffff20, // Word highlight
 		} };
 	return p;
 }
@@ -3223,6 +3377,7 @@ const TextEditor::Palette& TextEditor::GetLightPalette()
 			0x0000000a, // Current line fill
 			0x00000006, // Current line fill (inactive)
 			0x00000015, // Current line edge
+			0x00000020, // Word highlight
 		} };
 	return p;
 }
@@ -3251,6 +3406,7 @@ const TextEditor::Palette& TextEditor::GetRetroBluePalette()
 			0xffffff0a, // Current line fill
 			0xffffff06, // Current line fill (inactive)
 			0xffffff15, // Current line edge
+			0xffffff20, // Word highlight
 		} };
 	return p;
 }
@@ -3280,6 +3436,7 @@ const TextEditor::Palette& TextEditor::GetVsCodeDarkPalette()
 			0xffffff0a, // Current line fill
 			0xffffff06, // Current line fill (inactive)
 			0xffffff15, // Current line edge
+			0xffffff20, // Word highlight
 		} };
 	return p;
 }

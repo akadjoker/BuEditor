@@ -352,9 +352,20 @@ ImGuiKey ImGui_ImplSDL2_KeyEventToImGuiKey(SDL_Keycode keycode, SDL_Scancode sca
 static void ImGui_ImplSDL2_UpdateKeyModifiers(SDL_Keymod sdl_key_mods)
 {
     ImGuiIO& io = ImGui::GetIO();
-    io.AddKeyEvent(ImGuiMod_Ctrl, (sdl_key_mods & KMOD_CTRL) != 0);
+    bool ctrl = (sdl_key_mods & KMOD_CTRL) != 0;
+    bool alt = (sdl_key_mods & KMOD_ALT) != 0;
+    bool ralt = (sdl_key_mods & KMOD_RALT) != 0;
+    // AltGr on European keyboards: may appear as Ctrl+Alt or just RALT.
+    // Suppress both Ctrl and Alt when AltGr is detected so that character
+    // input (e.g. AltGr+7 = '{' on Portuguese keyboards) is not blocked.
+    if (ralt || (ctrl && alt))
+    {
+        ctrl = false;
+        alt = false;
+    }
+    io.AddKeyEvent(ImGuiMod_Ctrl, ctrl);
     io.AddKeyEvent(ImGuiMod_Shift, (sdl_key_mods & KMOD_SHIFT) != 0);
-    io.AddKeyEvent(ImGuiMod_Alt, (sdl_key_mods & KMOD_ALT) != 0);
+    io.AddKeyEvent(ImGuiMod_Alt, alt);
     io.AddKeyEvent(ImGuiMod_Super, (sdl_key_mods & KMOD_GUI) != 0);
 }
 

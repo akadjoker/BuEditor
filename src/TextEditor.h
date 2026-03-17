@@ -37,6 +37,8 @@ public:
 	inline bool IsReadOnlyEnabled() const { return mReadOnly; }
 	inline void SetAutoIndentEnabled(bool aValue) { mAutoIndent = aValue; }
 	inline bool IsAutoIndentEnabled() const { return mAutoIndent; }
+	inline void SetAutoCloseBracketsEnabled(bool aValue) { mAutoCloseBrackets = aValue; }
+	inline bool IsAutoCloseBracketsEnabled() const { return mAutoCloseBrackets; }
 	inline void SetShowWhitespacesEnabled(bool aValue) { mShowWhitespaces = aValue; }
 	inline bool IsShowWhitespacesEnabled() const { return mShowWhitespaces; }
 	inline void SetShowLineNumbersEnabled(bool aValue) { mShowLineNumbers = aValue; }
@@ -140,6 +142,7 @@ public:
 	void Indent() { ChangeCurrentLinesIndentation(true); }
 	void Unindent() { ChangeCurrentLinesIndentation(false); }
 	void AddNextOccurrence() { AddCursorForNextOccurrence(); }
+	void DuplicateLine() { DuplicateCurrentLines(); }
 
 
 private:
@@ -195,6 +198,7 @@ private:
 		CurrentLineFill,
 		CurrentLineFillInactive,
 		CurrentLineEdge,
+		WordHighlight,
 		Max
 	};
 
@@ -398,6 +402,7 @@ private:
 	void MoveDownCurrentLines();
 	void ToggleLineComment();
 	void RemoveCurrentLines();
+	void DuplicateCurrentLines();
 
 	float TextDistanceToLineStart(const Coordinates& aFrom, bool aSanitizeCoords = true) const;
 	void EnsureCursorVisible(int aCursor = -1, bool aStartToo = false);
@@ -448,6 +453,7 @@ private:
 	float mLineSpacing = 1.0f;
 	bool mReadOnly = false;
 	bool mAutoIndent = true;
+	bool mAutoCloseBrackets = true;
 	bool mShowWhitespaces = true;
 	bool mShowLineNumbers = true;
 	bool mShortTabs = false;

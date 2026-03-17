@@ -1,1 +1,25 @@
-
+{
+  "autosave_enabled": true,
+  "autosave_interval_ms": 1500,
+  "bugl_path": "bin/bugl",
+  "bytecode_output_path": "sintax.buc",
+  "console_visible": false,
+  "file_explorer_visible": true,
+  "font_choice": "custom",
+  "font_path": "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+  "font_scale": 1.3000000715255737,
+  "last_file_path": "sintax.bu",
+  "minimap_visible": true,
+  "outline_side": "right",
+  "outline_visible": true,
+  "palette": "vscode_dark",
+  "runtime": {
+    "binary_path": "bin/bugl",
+    "profile_name": "bugl"
+  },
+  "workspace": {
+    "bytecode_output_path": "sintax.buc",
+    "entry_script": "sintax.bu",
+    "root_path": ""
+  }
+}

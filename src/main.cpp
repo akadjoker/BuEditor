@@ -85,6 +85,7 @@ struct EditorSettings
 
 std::string gSettingsPath;
 std::string gLegacySettingsPath;
+std::string gProjectDir;
 
 struct AsyncCommandState
 {
@@ -294,6 +295,29 @@ const DocumentSymbol* FindInnermostSymbolAtLine(const std::deque<DocumentSymbol>
     return nullptr;
 }
 
+std::string BuildBreadcrumbPath(const std::deque<DocumentSymbol>& symbols, int line)
+{
+    std::string path;
+    const std::deque<DocumentSymbol>* current = &symbols;
+    while (current)
+    {
+        bool found = false;
+        for (const DocumentSymbol& symbol : *current)
+        {
+            if (line >= symbol.line && line <= symbol.end_line)
+            {
+                if (!path.empty()) path += " > ";
+                path += symbol.name;
+                current = &symbol.children;
+                found = true;
+                break;
+            }
+        }
+        if (!found) break;
+    }
+    return path;
+}
+
 bool FileExists(const std::string& path)
 {
     std::ifstream input(path, std::ios::binary);
@@ -346,6 +370,28 @@ std::string NormalizePath(const std::filesystem::path& path)
     }
 
     return path.lexically_normal().string();
+}
+
+// Convert an absolute path to relative (relative to project dir) for portable storage
+std::string ToRelativePath(const std::string& abs_path)
+{
+    if (abs_path.empty() || gProjectDir.empty()) return abs_path;
+    std::filesystem::path p(abs_path);
+    std::filesystem::path base(gProjectDir);
+    // Only relativize if the path is inside the project directory
+    auto rel = p.lexically_relative(base);
+    if (!rel.empty() && rel.string().substr(0, 2) != "..")
+        return rel.string();
+    return abs_path; // keep absolute if outside project dir (e.g. system font)
+}
+
+// Resolve a potentially relative path back to absolute (relative to project dir)
+std::string ToAbsolutePath(const std::string& rel_path)
+{
+    if (rel_path.empty() || gProjectDir.empty()) return rel_path;
+    std::filesystem::path p(rel_path);
+    if (p.is_absolute()) return rel_path;
+    return NormalizePath(std::filesystem::path(gProjectDir) / p);
 }
 
 std::string ResolveExistingPath(const std::string& value, const std::filesystem::path& executable_dir)
@@ -757,6 +803,12 @@ bool LoadSettings(EditorSettings& settings)
         }
     }
 
+    // Resolve relative paths to absolute (paths are stored relative to project root)
+    settings.font_path = ToAbsolutePath(settings.font_path);
+    settings.last_file_path = ToAbsolutePath(settings.last_file_path);
+    settings.bugl_path = ToAbsolutePath(settings.bugl_path);
+    settings.bytecode_output_path = ToAbsolutePath(settings.bytecode_output_path);
+
     if (settings.bugl_path.empty())
     {
         settings.bugl_path = GetDefaultBuglPath();
@@ -783,29 +835,35 @@ bool SaveSettings(const EditorSettings& settings)
         return false;
     }
 
+    // Convert absolute paths to relative (relative to project root) for portability
+    const std::string rel_font_path = ToRelativePath(settings.font_path);
+    const std::string rel_last_file = ToRelativePath(settings.last_file_path);
+    const std::string rel_bugl = ToRelativePath(settings.bugl_path);
+    const std::string rel_bytecode = ToRelativePath(settings.bytecode_output_path);
+
     json document = {
         {"autosave_enabled", settings.autosave_enabled},
         {"autosave_interval_ms", settings.autosave_interval_ms},
         {"console_visible", settings.console_visible},
         {"palette", PaletteIdToString(settings.palette)},
         {"font_choice", FontChoiceToString(settings.font_choice)},
-        {"font_path", settings.font_path},
+        {"font_path", rel_font_path},
         {"font_scale", settings.font_scale},
-        {"last_file_path", settings.last_file_path},
-        {"bugl_path", settings.bugl_path},
-        {"bytecode_output_path", settings.bytecode_output_path},
+        {"last_file_path", rel_last_file},
+        {"bugl_path", rel_bugl},
+        {"bytecode_output_path", rel_bytecode},
         {"outline_visible", settings.outline_visible},
         {"outline_side", OutlineSideToString(settings.outline_side)},
         {"file_explorer_visible", settings.file_explorer_visible},
         {"minimap_visible", settings.minimap_visible},
         {"runtime", {
             {"profile_name", "bugl"},
-            {"binary_path", settings.bugl_path},
+            {"binary_path", rel_bugl},
         }},
         {"workspace", {
             {"root_path", ""},
-            {"entry_script", settings.last_file_path},
-            {"bytecode_output_path", settings.bytecode_output_path},
+            {"entry_script", rel_last_file},
+            {"bytecode_output_path", rel_bytecode},
         }},
     };
 
@@ -873,6 +931,7 @@ int main(int argc, char** argv)
 {
     const std::filesystem::path executable_dir = GetExecutableDirectory(argc > 0 ? argv[0] : nullptr);
     const std::filesystem::path project_dir = GetProjectDirectory(executable_dir);
+    gProjectDir = NormalizePath(project_dir);
     gSettingsPath = NormalizePath(project_dir / "config" / "settings.json");
     gLegacySettingsPath = NormalizePath(project_dir / "settings.json");
 
@@ -1681,7 +1740,13 @@ int main(int argc, char** argv)
             if (event.type == SDL_KEYDOWN && event.key.repeat == 0)
             {
                 const bool ctrl_down = (event.key.keysym.mod & KMOD_CTRL) != 0;
-                if (ctrl_down)
+                const bool alt_down = (event.key.keysym.mod & KMOD_ALT) != 0;
+                const bool ralt_down = (event.key.keysym.mod & KMOD_RALT) != 0;
+                // AltGr detection: on some systems AltGr = Ctrl+Alt, on others just RALT
+                const bool altgr_down = ralt_down || (ctrl_down && alt_down);
+
+                // Normal Ctrl shortcuts (skip when AltGr is active)
+                if (ctrl_down && !altgr_down)
                 {
                     if (event.key.keysym.sym == SDLK_n)
                     {
@@ -1770,6 +1835,11 @@ int main(int argc, char** argv)
                              event.key.keysym.scancode == SDL_SCANCODE_SLASH)
                     {
                         at->editor.ToggleComment();
+                    }
+                    else if (event.key.keysym.sym == SDLK_d && (event.key.keysym.mod & KMOD_SHIFT) != 0)
+                    {
+                        at->editor.DuplicateLine();
+                        status = "Line duplicated";
                     }
                     else if (event.key.keysym.sym == SDLK_LEFTBRACKET && (event.key.keysym.mod & KMOD_SHIFT) != 0)
                     {
@@ -1911,6 +1981,12 @@ int main(int argc, char** argv)
                 {
                     go_to_line.visible = true;
                     go_to_line.focus_input = true;
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Duplicate Line", "Ctrl+Shift+D"))
+                {
+                    at->editor.DuplicateLine();
+                    status = "Line duplicated";
                 }
                 ImGui::EndMenu();
             }
@@ -2532,6 +2608,11 @@ int main(int argc, char** argv)
             {
                 at->editor.Unindent();
             }
+            if (ImGui::MenuItem("Duplicate Line", "Ctrl+Shift+D"))
+            {
+                at->editor.DuplicateLine();
+                status = "Line duplicated";
+            }
             ImGui::Separator();
             if (ImGui::BeginMenu("Format"))
             {
@@ -2797,18 +2878,17 @@ int main(int argc, char** argv)
 
         // Tab count indicator
         const int tab_count = static_cast<int>(tabs.size());
-        ImGui::Text("BuLang | Tabs: %d | Theme: %s | Font: %s | Zoom: %d%% | Autosave: %s | GIF: %s | Tool: %s | Lines: %d | Cursor: %d:%d | %s | Status: %s",
-                    tab_count,
-                    theme_name,
-                    font_name.c_str(),
-                    static_cast<int>(at->editor.GetFontScale() * 100.0f),
-                    settings.autosave_enabled ? "On" : "Off",
-                    gif_state,
-                    command_running ? "Running" : "Idle",
+        std::string breadcrumb = BuildBreadcrumbPath(at->outline_symbols, cursor_line);
+        ImGui::Text("BuLang | %s%sLines: %d | Cursor: %d:%d | %s | Tabs: %d | Theme: %s | Zoom: %d%% | %s",
+                    breadcrumb.empty() ? "" : breadcrumb.c_str(),
+                    breadcrumb.empty() ? "" : " | ",
                     at->editor.GetLineCount(),
                     cursor_line + 1,
                     cursor_column + 1,
                     dirty ? "Modified" : "Saved",
+                    tab_count,
+                    theme_name,
+                    static_cast<int>(at->editor.GetFontScale() * 100.0f),
                     status.c_str());
         ImGui::End();
 

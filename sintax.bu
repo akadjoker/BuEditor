@@ -22,6 +22,9 @@
 // nil
 var nothing = nil;
 
+def teste()
+{}
+
 // booleans
 var yes = true;
 var no = false;
