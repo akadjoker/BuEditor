@@ -1,9 +1,13 @@
 #include "DocumentSymbols.h"
+#include "EditorTab.h"
 #include "GifRecorder.h"
 #include "ImGuiFileDialog.h"
+#include "ImGuiFileExplorer.h"
 #include "ImGuiConsole.h"
 #include "ImGuiFontAwesome.h"
+#include "ImGuiMinimap.h"
 #include "ImGuiSplitter.h"
+#include "SnippetManager.h"
 #include "TextEditor.h"
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
@@ -38,6 +42,9 @@ namespace
 {
 using json = nlohmann::json;
 
+constexpr const char* kBuEditorVersion = "0.2.0";
+constexpr const char* kBuEditorBuildDate = __DATE__;
+
 enum class EditorFontChoice
 {
     Default,
@@ -71,7 +78,9 @@ struct EditorSettings
     std::string bugl_path;
     std::string bytecode_output_path;
     bool outline_visible = true;
-    OutlineSide outline_side = OutlineSide::Left;
+    OutlineSide outline_side = OutlineSide::Right;
+    bool file_explorer_visible = true;
+    bool minimap_visible = false;
 };
 
 std::string gSettingsPath;
@@ -118,7 +127,33 @@ struct OutlineState
     bool visible = true;
     float width = 220.0f;
     OutlineSide side = OutlineSide::Left;
-    std::deque<DocumentSymbol> symbols;
+};
+
+struct FileExplorerState
+{
+    bool visible = true;
+    float width = 200.0f;
+    FileNode root;
+};
+
+struct MinimapState
+{
+    bool visible = false;
+    float width = 80.0f;
+};
+
+struct SnippetPopupState
+{
+    bool visible = false;
+    bool focus_filter = false;
+    std::string filter;
+};
+
+struct UnsavedCloseState
+{
+    bool visible = false;
+    int tab_index = -1;   // -1 means closing app
+    bool closing_app = false;
 };
 
 std::vector<size_t> BuildLineOffsets(const std::string& text)
@@ -691,6 +726,14 @@ bool LoadSettings(EditorSettings& settings)
     {
         settings.outline_side = OutlineSideFromString(document["outline_side"].get<std::string>());
     }
+    if (document.contains("file_explorer_visible") && document["file_explorer_visible"].is_boolean())
+    {
+        settings.file_explorer_visible = document["file_explorer_visible"].get<bool>();
+    }
+    if (document.contains("minimap_visible") && document["minimap_visible"].is_boolean())
+    {
+        settings.minimap_visible = document["minimap_visible"].get<bool>();
+    }
 
     if (document.contains("runtime") && document["runtime"].is_object())
     {
@@ -753,6 +796,8 @@ bool SaveSettings(const EditorSettings& settings)
         {"bytecode_output_path", settings.bytecode_output_path},
         {"outline_visible", settings.outline_visible},
         {"outline_side", OutlineSideToString(settings.outline_side)},
+        {"file_explorer_visible", settings.file_explorer_visible},
+        {"minimap_visible", settings.minimap_visible},
         {"runtime", {
             {"profile_name", "bugl"},
             {"binary_path", settings.bugl_path},
@@ -895,7 +940,7 @@ int main(int argc, char** argv)
     const std::string droid_sans_path = ResolveExistingPath("vendor/recastnavigation/RecastDemo/Bin/DroidSans.ttf", executable_dir);
     if (FileExists(droid_sans_path))
     {
-        droid_sans_font = io.Fonts->AddFontFromFileTTF(droid_sans_path.c_str(), 18.0f);
+        droid_sans_font = io.Fonts->AddFontFromFileTTF(droid_sans_path.c_str(), 16.0f);
         if (droid_sans_font != nullptr)
         {
             editor_fonts.push_back({"droid_sans", "Vendor: Droid Sans", droid_sans_font});
@@ -904,7 +949,7 @@ int main(int argc, char** argv)
 
     for (const auto& [font_path, label] : discovered_fonts)
     {
-        ImFont* font = io.Fonts->AddFontFromFileTTF(font_path.c_str(), 18.0f);
+        ImFont* font = io.Fonts->AddFontFromFileTTF(font_path.c_str(), 16.0f);
         if (font != nullptr)
         {
             editor_fonts.push_back({font_path, label, font});
@@ -935,7 +980,6 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    TextEditor editor;
     EditorSettings settings;
     LoadSettings(settings);
     if (settings.bugl_path.empty())
@@ -958,8 +1002,31 @@ int main(int argc, char** argv)
 
     if (settings.font_choice == EditorFontChoice::DroidSans && find_font_entry("droid_sans") == nullptr)
     {
-        settings.font_choice = EditorFontChoice::Default;
-        settings.font_path.clear();
+        // Try to auto-select a system monospace font (DejaVu Sans Mono preferred)
+        const EditorFontEntry* mono_font = nullptr;
+        for (const auto& entry : editor_fonts)
+        {
+            if (entry.label.find("DejaVu") != std::string::npos ||
+                entry.label.find("Liberation") != std::string::npos ||
+                entry.label.find("Ubuntu") != std::string::npos ||
+                entry.label.find("JetBrains") != std::string::npos ||
+                entry.label.find("Fira") != std::string::npos ||
+                entry.label.find("Noto") != std::string::npos)
+            {
+                mono_font = &entry;
+                break;
+            }
+        }
+        if (mono_font)
+        {
+            settings.font_choice = EditorFontChoice::Custom;
+            settings.font_path = mono_font->id;
+        }
+        else
+        {
+            settings.font_choice = EditorFontChoice::Default;
+            settings.font_path.clear();
+        }
     }
     if (settings.font_choice == EditorFontChoice::Custom && find_font_entry(settings.font_path) == nullptr)
     {
@@ -968,45 +1035,81 @@ int main(int argc, char** argv)
     }
     SaveSettings(settings);
 
-    editor.SetPalette(settings.palette);
-    editor.SetLanguageDefinition(TextEditor::LanguageDefinitionId::BuLang);
-    editor.SetShowWhitespacesEnabled(false);
-    editor.SetShortTabsEnabled(true);
-    editor.SetTabSize(4);
-    editor.SetAutoIndentEnabled(true);
-    editor.SetFontScale(settings.font_scale);
+    // ── Tab system ──
+    std::vector<std::unique_ptr<EditorTab>> tabs;
+    int active_tab_index = 0;
+    int switch_to_tab = -1;
+    EditorTab* at = nullptr;
+
+    auto init_tab_editor = [&](TextEditor& ed)
+    {
+        ed.SetPalette(settings.palette);
+        ed.SetLanguageDefinition(TextEditor::LanguageDefinitionId::BuLang);
+        ed.SetShowWhitespacesEnabled(false);
+        ed.SetShortTabsEnabled(true);
+        ed.SetTabSize(4);
+        ed.SetAutoIndentEnabled(true);
+        ed.SetFontScale(settings.font_scale);
+    };
+
+    auto create_tab = [&](const std::string& path = "") -> int
+    {
+        auto tab = std::make_unique<EditorTab>();
+        init_tab_editor(tab->editor);
+        tab->file_path = path;
+        tab->last_edit_ticks = SDL_GetTicks();
+        tabs.push_back(std::move(tab));
+        return static_cast<int>(tabs.size()) - 1;
+    };
+
+    auto find_tab_by_path = [&](const std::string& path) -> int
+    {
+        for (int i = 0; i < static_cast<int>(tabs.size()); ++i)
+        {
+            if (tabs[i]->file_path == path) return i;
+        }
+        return -1;
+    };
+
+    create_tab(ResolveExistingPath(settings.last_file_path, executable_dir));
+    active_tab_index = 0;
+    at = tabs[0].get();
 
     bool done = false;
-    std::string file_path = ResolveExistingPath(settings.last_file_path, executable_dir);
     std::string bugl_path = ResolveExistingPath(settings.bugl_path, executable_dir);
     std::string bytecode_output_path = settings.bytecode_output_path.empty()
-        ? ResolveWritablePath(GetDefaultBytecodePath(file_path), executable_dir)
+        ? ResolveWritablePath(GetDefaultBytecodePath(at->file_path), executable_dir)
         : ResolveWritablePath(settings.bytecode_output_path, executable_dir);
     std::string status = "Ready";
     std::string command_output;
     std::string last_command_label;
     std::string last_command_line;
-    std::string last_saved_text;
-    std::string last_seen_text;
     EditorFontChoice font_choice = settings.font_choice;
-    Uint32 last_edit_ticks = SDL_GetTicks();
-    Uint32 last_autosave_ticks = 0;
     ImGuiFileDialog file_dialog;
     GifRecorder gif_recorder;
     ImGuiConsole console;
     FindReplaceState find_replace;
     GoToLineState go_to_line;
     FontPickerState font_picker;
+    SnippetPopupState snippet_popup;
+    UnsavedCloseState unsaved_close;
     OutlineState outline;
     outline.visible = settings.outline_visible;
     outline.side = settings.outline_side;
+    FileExplorerState file_explorer;
+    file_explorer.visible = settings.file_explorer_visible;
+    file_explorer.root.name = project_dir.filename().string();
+    file_explorer.root.full_path = project_dir.string();
+    file_explorer.root.is_directory = true;
+    MinimapState minimap;
+    minimap.visible = settings.minimap_visible;
     console.SetVisible(settings.console_visible);
     auto command_state = std::make_shared<AsyncCommandState>();
 
     auto apply_palette = [&](TextEditor::PaletteId palette, const char* label)
     {
         settings.palette = palette;
-        editor.SetPalette(palette);
+        for (auto& tab : tabs) tab->editor.SetPalette(palette);
         SaveSettings(settings);
         status = std::string("Theme: ") + label;
     };
@@ -1062,14 +1165,15 @@ int main(int argc, char** argv)
     };
     auto adjust_zoom = [&](float delta)
     {
-        editor.SetFontScale(editor.GetFontScale() + delta);
-        settings.font_scale = editor.GetFontScale();
+        const float new_scale = at->editor.GetFontScale() + delta;
+        for (auto& tab : tabs) tab->editor.SetFontScale(new_scale);
+        settings.font_scale = new_scale;
         SaveSettings(settings);
-        status = "Zoom: " + std::to_string(static_cast<int>(editor.GetFontScale() * 100.0f)) + "%";
+        status = "Zoom: " + std::to_string(static_cast<int>(new_scale * 100.0f)) + "%";
     };
     auto sync_paths_to_settings = [&]()
     {
-        settings.last_file_path = file_path;
+        settings.last_file_path = at->file_path;
         settings.bugl_path = bugl_path;
         settings.bytecode_output_path = bytecode_output_path;
         SaveSettings(settings);
@@ -1143,14 +1247,14 @@ int main(int argc, char** argv)
     };
     auto navigate_to_line = [&](int line)
     {
-        const int clamped_line = std::max(0, std::min(line, editor.GetLineCount() - 1));
-        editor.SetCursorPosition(clamped_line, 0);
-        editor.SetViewAtLine(clamped_line, TextEditor::SetViewAtLineMode::Centered);
+        const int clamped_line = std::max(0, std::min(line, at->editor.GetLineCount() - 1));
+        at->editor.SetCursorPosition(clamped_line, 0);
+        at->editor.SetViewAtLine(clamped_line, TextEditor::SetViewAtLineMode::Centered);
         status = "Line " + std::to_string(clamped_line + 1);
     };
     auto find_next = [&](bool forward)
     {
-        const std::string current_text = editor.GetText();
+        const std::string current_text = at->editor.GetText();
         if (find_replace.find_text.empty() || current_text.empty())
         {
             status = "Find text is empty";
@@ -1158,11 +1262,11 @@ int main(int argc, char** argv)
         }
 
         const std::vector<size_t> line_offsets = BuildLineOffsets(current_text);
-        const TextEditor::SelectionPosition selection = editor.GetSelectionPosition();
+        const TextEditor::SelectionPosition selection = at->editor.GetSelectionPosition();
         const bool has_selection =
             selection.start.line >= 0 &&
             (selection.start.line != selection.end.line || selection.start.column != selection.end.column);
-        const TextEditor::TextPosition cursor = editor.GetCursorPosition();
+        const TextEditor::TextPosition cursor = at->editor.GetCursorPosition();
         const size_t start_offset = has_selection
             ? LineColumnToOffset(line_offsets,
                                  forward ? selection.end.line : selection.start.line,
@@ -1179,8 +1283,8 @@ int main(int argc, char** argv)
 
         const TextEditor::TextPosition start = OffsetToTextPosition(line_offsets, match_start);
         const TextEditor::TextPosition end = OffsetToTextPosition(line_offsets, match_end);
-        editor.SetSelectionPosition({start, end});
-        editor.SetViewAtLine(start.line, TextEditor::SetViewAtLineMode::Centered);
+        at->editor.SetSelectionPosition({start, end});
+        at->editor.SetViewAtLine(start.line, TextEditor::SetViewAtLineMode::Centered);
         status = "Match at line " + std::to_string(start.line + 1);
         return true;
     };
@@ -1192,30 +1296,30 @@ int main(int argc, char** argv)
             return false;
         }
 
-        std::string current_text = editor.GetText();
-        const TextEditor::SelectionPosition selection = editor.GetSelectionPosition();
-        const std::string selected_text = editor.GetSelectedText();
+        std::string current_text = at->editor.GetText();
+        const TextEditor::SelectionPosition selection = at->editor.GetSelectionPosition();
+        const std::string selected_text = at->editor.GetSelectedText();
         if (selected_text.empty() || !SelectionMatchesQuery(selected_text, find_replace.find_text, find_replace.case_sensitive))
         {
             if (!find_next(true))
             {
                 return false;
             }
-            current_text = editor.GetText();
+            current_text = at->editor.GetText();
         }
 
         const std::vector<size_t> line_offsets = BuildLineOffsets(current_text);
-        const TextEditor::SelectionPosition updated_selection = editor.GetSelectionPosition();
+        const TextEditor::SelectionPosition updated_selection = at->editor.GetSelectionPosition();
         const size_t start_offset = LineColumnToOffset(line_offsets, updated_selection.start.line, updated_selection.start.column);
         const size_t end_offset = LineColumnToOffset(line_offsets, updated_selection.end.line, updated_selection.end.column);
         current_text.replace(start_offset, end_offset - start_offset, find_replace.replace_text);
-        editor.SetText(current_text);
+        at->editor.SetText(current_text);
 
         const std::vector<size_t> new_offsets = BuildLineOffsets(current_text);
         const TextEditor::TextPosition new_start = OffsetToTextPosition(new_offsets, start_offset);
         const TextEditor::TextPosition new_end = OffsetToTextPosition(new_offsets, start_offset + find_replace.replace_text.size());
-        editor.SetSelectionPosition({new_start, new_end});
-        editor.SetViewAtLine(new_start.line, TextEditor::SetViewAtLineMode::Centered);
+        at->editor.SetSelectionPosition({new_start, new_end});
+        at->editor.SetViewAtLine(new_start.line, TextEditor::SetViewAtLineMode::Centered);
         status = "Replaced selection";
         return true;
     };
@@ -1227,7 +1331,7 @@ int main(int argc, char** argv)
             return false;
         }
 
-        const std::string source_text = editor.GetText();
+        const std::string source_text = at->editor.GetText();
         if (source_text.empty())
         {
             status = "Document is empty";
@@ -1261,34 +1365,34 @@ int main(int argc, char** argv)
             return false;
         }
 
-        editor.SetText(result);
+        at->editor.SetText(result);
         status = "Replaced " + std::to_string(replaced_count) + " matches";
         return true;
     };
 
     auto run_new = [&]()
     {
-        editor.SetText("");
-        last_saved_text.clear();
-        last_seen_text.clear();
-        last_edit_ticks = SDL_GetTicks();
+        const int idx = create_tab();
+        active_tab_index = idx;
+        at = tabs[idx].get();
+        switch_to_tab = idx;
         status = "New file";
     };
     auto open_open_popup = [&]()
     {
         std::filesystem::path start_directory = GetProjectDirectory(executable_dir) / "scripts";
-        if (!file_path.empty())
+        if (!at->file_path.empty())
         {
-            start_directory = std::filesystem::path(ResolveExistingPath(file_path, executable_dir)).parent_path();
+            start_directory = std::filesystem::path(ResolveExistingPath(at->file_path, executable_dir)).parent_path();
         }
         file_dialog.Open(ImGuiFileDialog::Mode::OpenFile,
                          start_directory,
-                         std::filesystem::path(file_path).filename().string());
+                         std::filesystem::path(at->file_path).filename().string());
     };
     auto open_save_as_popup = [&]()
     {
         std::filesystem::path start_directory = GetProjectDirectory(executable_dir) / "scripts";
-        const std::string seed_path = file_path.empty() ? settings.last_file_path : file_path;
+        const std::string seed_path = at->file_path.empty() ? settings.last_file_path : at->file_path;
         if (!seed_path.empty())
         {
             start_directory = std::filesystem::path(ResolveWritablePath(seed_path, executable_dir)).parent_path();
@@ -1299,50 +1403,68 @@ int main(int argc, char** argv)
     };
     auto run_open = [&]()
     {
-        if (file_path.empty())
+        if (at->file_path.empty())
         {
             status = "Set a file path before opening.";
             return;
         }
 
         std::string loaded_text;
-        const std::string resolved_path = ResolveExistingPath(file_path, executable_dir);
+        const std::string resolved_path = ResolveExistingPath(at->file_path, executable_dir);
         if (LoadTextFile(resolved_path, loaded_text, status))
         {
-            file_path = resolved_path;
-            editor.SetText(loaded_text);
-            last_saved_text = loaded_text;
-            last_seen_text = loaded_text;
-            outline.symbols = ScanDocumentSymbols(loaded_text);
-            settings.last_file_path = file_path;
-            bytecode_output_path = ResolveWritablePath(GetDefaultBytecodePath(file_path), executable_dir);
+            at->file_path = resolved_path;
+            at->editor.SetText(loaded_text);
+            at->last_saved_text = loaded_text;
+            at->last_seen_text = loaded_text;
+            at->outline_symbols = ScanDocumentSymbols(loaded_text);
+            settings.last_file_path = at->file_path;
+            bytecode_output_path = ResolveWritablePath(GetDefaultBytecodePath(at->file_path), executable_dir);
             settings.bytecode_output_path = bytecode_output_path;
             SaveSettings(settings);
         }
     };
+    auto open_file_in_tab = [&](const std::string& path)
+    {
+        const std::string resolved = ResolveExistingPath(path, executable_dir);
+        int existing = find_tab_by_path(resolved);
+        if (existing >= 0)
+        {
+            active_tab_index = existing;
+            at = tabs[existing].get();
+            switch_to_tab = existing;
+            status = "Switched to " + at->GetTitle();
+            return;
+        }
+        const int idx = create_tab(resolved);
+        active_tab_index = idx;
+        at = tabs[idx].get();
+        switch_to_tab = idx;
+        run_open();
+    };
     auto run_save = [&]()
     {
-        if (file_path.empty())
+        if (at->file_path.empty())
         {
             status = "Set a file path before saving.";
             return;
         }
 
-        const std::string resolved_path = ResolveWritablePath(file_path, executable_dir);
-        const std::string current_text = editor.GetText();
+        const std::string resolved_path = ResolveWritablePath(at->file_path, executable_dir);
+        const std::string current_text = at->editor.GetText();
         if (SaveTextFile(resolved_path, current_text, status))
         {
-            file_path = resolved_path;
-            last_saved_text = current_text;
-            last_seen_text = current_text;
-            last_autosave_ticks = SDL_GetTicks();
-            settings.last_file_path = file_path;
+            at->file_path = resolved_path;
+            at->last_saved_text = current_text;
+            at->last_seen_text = current_text;
+            at->last_autosave_ticks = SDL_GetTicks();
+            settings.last_file_path = at->file_path;
             SaveSettings(settings);
         }
     };
     auto ensure_script_ready = [&]() -> bool
     {
-        if (file_path.empty())
+        if (at->file_path.empty())
         {
             status = "Set a script path first.";
             return false;
@@ -1359,12 +1481,12 @@ int main(int argc, char** argv)
             return false;
         }
 
-        file_path = ResolveWritablePath(file_path, executable_dir);
-        const std::string current_text = editor.GetText();
-        if (current_text != last_saved_text)
+        at->file_path = ResolveWritablePath(at->file_path, executable_dir);
+        const std::string current_text = at->editor.GetText();
+        if (current_text != at->last_saved_text)
         {
             run_save();
-            if (editor.GetText() != last_saved_text)
+            if (at->editor.GetText() != at->last_saved_text)
             {
                 return false;
             }
@@ -1381,7 +1503,7 @@ int main(int argc, char** argv)
         }
 
         const std::string command =
-            QuoteCommandArgument(bugl_path) + " " + QuoteCommandArgument(file_path);
+            QuoteCommandArgument(bugl_path) + " " + QuoteCommandArgument(at->file_path);
         launch_command("Run Script", command);
     };
     auto run_compile_bytecode = [&]()
@@ -1392,24 +1514,97 @@ int main(int argc, char** argv)
         }
 
         bytecode_output_path = ResolveWritablePath(
-            bytecode_output_path.empty() ? GetDefaultBytecodePath(file_path) : bytecode_output_path,
+            bytecode_output_path.empty() ? GetDefaultBytecodePath(at->file_path) : bytecode_output_path,
             executable_dir);
 
         sync_paths_to_settings();
         const std::string command =
             QuoteCommandArgument(bugl_path) + " --compile-bc " +
-            QuoteCommandArgument(file_path) + " " +
+            QuoteCommandArgument(at->file_path) + " " +
             QuoteCommandArgument(bytecode_output_path);
         launch_command("Compile Bytecode", command);
     };
 
-    if (!file_path.empty())
+    auto close_tab = [&](int index)
+    {
+        if (index < 0 || index >= static_cast<int>(tabs.size()))
+        {
+            return;
+        }
+        if (tabs[index]->IsDirty())
+        {
+            unsaved_close.visible = true;
+            unsaved_close.tab_index = index;
+            unsaved_close.closing_app = false;
+            return;
+        }
+        tabs.erase(tabs.begin() + index);
+        if (tabs.empty())
+        {
+            create_tab();
+        }
+        if (active_tab_index >= static_cast<int>(tabs.size()))
+        {
+            active_tab_index = static_cast<int>(tabs.size()) - 1;
+        }
+        at = tabs[active_tab_index].get();
+        status = "Tab closed";
+    };
+
+    auto force_close_tab = [&](int index)
+    {
+        if (index < 0 || index >= static_cast<int>(tabs.size()))
+        {
+            return;
+        }
+        tabs.erase(tabs.begin() + index);
+        if (tabs.empty())
+        {
+            create_tab();
+        }
+        if (active_tab_index >= static_cast<int>(tabs.size()))
+        {
+            active_tab_index = static_cast<int>(tabs.size()) - 1;
+        }
+        at = tabs[active_tab_index].get();
+        status = "Tab closed";
+    };
+
+    auto insert_snippet = [&](const BuLangSnippet& snippet)
+    {
+        int cursor_offset = -1;
+        const std::string text = SnippetManager::PrepareSnippetText(snippet, cursor_offset);
+        // Get current text, insert at cursor position, set text
+        const std::string current = at->editor.GetText();
+        const auto pos = at->editor.GetCursorPosition();
+        const std::vector<size_t> offsets = BuildLineOffsets(current);
+        const size_t insert_offset = LineColumnToOffset(offsets, pos.line, pos.column);
+        std::string updated = current;
+        updated.insert(insert_offset, text);
+        at->editor.SetText(updated);
+        // Place cursor after inserted text
+        const std::vector<size_t> new_offsets = BuildLineOffsets(updated);
+        const size_t new_cursor_offset = (cursor_offset >= 0)
+            ? insert_offset + static_cast<size_t>(cursor_offset)
+            : insert_offset + text.size();
+        const auto new_pos = OffsetToTextPosition(new_offsets, new_cursor_offset);
+        at->editor.SetCursorPosition(new_pos.line, new_pos.column);
+        status = "Snippet: " + snippet.name;
+    };
+
+    if (!at->file_path.empty())
     {
         run_open();
     }
 
     while (!done)
     {
+        // Update active tab pointer
+        if (active_tab_index >= 0 && active_tab_index < static_cast<int>(tabs.size()))
+        {
+            at = tabs[active_tab_index].get();
+        }
+
         {
             std::lock_guard<std::mutex> lock(command_state->mutex);
             if (command_state->running)
@@ -1436,13 +1631,52 @@ int main(int argc, char** argv)
             ImGui_ImplSDL2_ProcessEvent(&event);
             if (event.type == SDL_QUIT)
             {
-                done = true;
+                // Check for unsaved changes before quitting
+                bool has_unsaved = false;
+                for (const auto& tab : tabs)
+                {
+                    if (tab->IsDirty()) { has_unsaved = true; break; }
+                }
+                if (has_unsaved)
+                {
+                    unsaved_close.visible = true;
+                    unsaved_close.tab_index = -1;
+                    unsaved_close.closing_app = true;
+                }
+                else
+                {
+                    done = true;
+                }
             }
             if (event.type == SDL_WINDOWEVENT &&
                 event.window.event == SDL_WINDOWEVENT_CLOSE &&
                 event.window.windowID == SDL_GetWindowID(window))
             {
-                done = true;
+                bool has_unsaved = false;
+                for (const auto& tab : tabs)
+                {
+                    if (tab->IsDirty()) { has_unsaved = true; break; }
+                }
+                if (has_unsaved)
+                {
+                    unsaved_close.visible = true;
+                    unsaved_close.tab_index = -1;
+                    unsaved_close.closing_app = true;
+                }
+                else
+                {
+                    done = true;
+                }
+            }
+            // Drag & Drop: open dropped files
+            if (event.type == SDL_DROPFILE)
+            {
+                const char* dropped_file = event.drop.file;
+                if (dropped_file)
+                {
+                    open_file_in_tab(std::string(dropped_file));
+                }
+                SDL_free(event.drop.file);
             }
             if (event.type == SDL_KEYDOWN && event.key.repeat == 0)
             {
@@ -1465,7 +1699,7 @@ int main(int argc, char** argv)
                         }
                         else
                         {
-                            if (file_path.empty())
+                            if (at->file_path.empty())
                             {
                                 open_save_as_popup();
                             }
@@ -1502,10 +1736,27 @@ int main(int argc, char** argv)
                     }
                     else if (event.key.keysym.sym == SDLK_0 || event.key.keysym.sym == SDLK_KP_0)
                     {
-                        editor.SetFontScale(1.0f);
+                        for (auto& tab : tabs) tab->editor.SetFontScale(1.0f);
                         settings.font_scale = 1.0f;
                         SaveSettings(settings);
                         status = "Zoom reset";
+                    }
+                    else if (event.key.keysym.sym == SDLK_w)
+                    {
+                        close_tab(active_tab_index);
+                    }
+                    else if (event.key.keysym.sym == SDLK_SPACE)
+                    {
+                        snippet_popup.visible = true;
+                        snippet_popup.focus_filter = true;
+                        snippet_popup.filter.clear();
+                    }
+                    else if (event.key.keysym.sym == SDLK_b)
+                    {
+                        file_explorer.visible = !file_explorer.visible;
+                        settings.file_explorer_visible = file_explorer.visible;
+                        SaveSettings(settings);
+                        status = file_explorer.visible ? "Explorer shown" : "Explorer hidden";
                     }
                 }
                 else if (event.key.keysym.sym == SDLK_F5)
@@ -1552,7 +1803,7 @@ int main(int argc, char** argv)
                 }
                 if (ImGui::MenuItem("Save", "Ctrl+S"))
                 {
-                    if (file_path.empty())
+                    if (at->file_path.empty())
                     {
                         open_save_as_popup();
                     }
@@ -1566,11 +1817,35 @@ int main(int argc, char** argv)
                     open_save_as_popup();
                 }
                 ImGui::Separator();
+                if (ImGui::MenuItem("Close Tab", "Ctrl+W"))
+                {
+                    close_tab(active_tab_index);
+                }
+                ImGui::Separator();
                 if (ImGui::MenuItem("Autosave", nullptr, settings.autosave_enabled))
                 {
                     settings.autosave_enabled = !settings.autosave_enabled;
                     SaveSettings(settings);
                     status = settings.autosave_enabled ? "Autosave enabled" : "Autosave disabled";
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Exit", "Alt+F4"))
+                {
+                    bool has_unsaved = false;
+                    for (const auto& tab : tabs)
+                    {
+                        if (tab->IsDirty()) { has_unsaved = true; break; }
+                    }
+                    if (has_unsaved)
+                    {
+                        unsaved_close.visible = true;
+                        unsaved_close.tab_index = -1;
+                        unsaved_close.closing_app = true;
+                    }
+                    else
+                    {
+                        done = true;
+                    }
                 }
                 ImGui::EndMenu();
             }
@@ -1600,6 +1875,25 @@ int main(int argc, char** argv)
                 {
                     go_to_line.visible = true;
                     go_to_line.focus_input = true;
+                }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Snippets"))
+            {
+                for (const auto& snippet : SnippetManager::GetSnippets())
+                {
+                    const std::string label = snippet.name + " - " + snippet.description;
+                    if (ImGui::MenuItem(label.c_str()))
+                    {
+                        insert_snippet(snippet);
+                    }
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Snippet Popup...", "Ctrl+Space"))
+                {
+                    snippet_popup.visible = true;
+                    snippet_popup.focus_filter = true;
+                    snippet_popup.filter.clear();
                 }
                 ImGui::EndMenu();
             }
@@ -1645,12 +1939,24 @@ int main(int argc, char** argv)
                 }
                 if (ImGui::MenuItem("Reset Zoom", "Ctrl+0"))
                 {
-                    editor.SetFontScale(1.0f);
+                    for (auto& tab : tabs) tab->editor.SetFontScale(1.0f);
                     settings.font_scale = 1.0f;
                     SaveSettings(settings);
                     status = "Zoom reset";
                 }
                 ImGui::Separator();
+                if (ImGui::MenuItem("File Explorer", "Ctrl+B", file_explorer.visible))
+                {
+                    file_explorer.visible = !file_explorer.visible;
+                    settings.file_explorer_visible = file_explorer.visible;
+                    SaveSettings(settings);
+                }
+                if (ImGui::MenuItem("Minimap", nullptr, minimap.visible))
+                {
+                    minimap.visible = !minimap.visible;
+                    settings.minimap_visible = minimap.visible;
+                    SaveSettings(settings);
+                }
                 if (ImGui::MenuItem("Console", "F8", console.IsVisible()))
                 {
                     console.SetVisible(!console.IsVisible());
@@ -1685,23 +1991,23 @@ int main(int argc, char** argv)
                     }
                 }
                 ImGui::Separator();
-                if (ImGui::MenuItem("VSCode Dark", nullptr, editor.GetPalette() == TextEditor::PaletteId::VsCodeDark))
+                if (ImGui::MenuItem("VSCode Dark", nullptr, at->editor.GetPalette() == TextEditor::PaletteId::VsCodeDark))
                 {
                     apply_palette(TextEditor::PaletteId::VsCodeDark, "VSCode Dark");
                 }
-                if (ImGui::MenuItem("Mariana", nullptr, editor.GetPalette() == TextEditor::PaletteId::Mariana))
+                if (ImGui::MenuItem("Mariana", nullptr, at->editor.GetPalette() == TextEditor::PaletteId::Mariana))
                 {
                     apply_palette(TextEditor::PaletteId::Mariana, "Mariana");
                 }
-                if (ImGui::MenuItem("Dark", nullptr, editor.GetPalette() == TextEditor::PaletteId::Dark))
+                if (ImGui::MenuItem("Dark", nullptr, at->editor.GetPalette() == TextEditor::PaletteId::Dark))
                 {
                     apply_palette(TextEditor::PaletteId::Dark, "Dark");
                 }
-                if (ImGui::MenuItem("Light", nullptr, editor.GetPalette() == TextEditor::PaletteId::Light))
+                if (ImGui::MenuItem("Light", nullptr, at->editor.GetPalette() == TextEditor::PaletteId::Light))
                 {
                     apply_palette(TextEditor::PaletteId::Light, "Light");
                 }
-                if (ImGui::MenuItem("Retro Blue", nullptr, editor.GetPalette() == TextEditor::PaletteId::RetroBlue))
+                if (ImGui::MenuItem("Retro Blue", nullptr, at->editor.GetPalette() == TextEditor::PaletteId::RetroBlue))
                 {
                     apply_palette(TextEditor::PaletteId::RetroBlue, "Retro Blue");
                 }
@@ -1710,6 +2016,16 @@ int main(int argc, char** argv)
                 {
                     open_font_picker();
                 }
+                ImGui::EndMenu();
+            }
+            if (ImGui::BeginMenu("Help"))
+            {
+                ImGui::MenuItem("About BuEditor", nullptr, false, false);
+                ImGui::Separator();
+                ImGui::Text("Version: %s", kBuEditorVersion);
+                ImGui::Text("Build: %s", kBuEditorBuildDate);
+                ImGui::Text("ImGui: %s", IMGUI_VERSION);
+                ImGui::Text("SDL: %d.%d.%d", SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL);
                 ImGui::EndMenu();
             }
             ImGui::EndMainMenuBar();
@@ -1731,13 +2047,13 @@ int main(int argc, char** argv)
             const ImGuiFileDialog::Result result = file_dialog.ConsumeResult();
             if (result.accepted)
             {
-                file_path = result.path.string();
                 if (result.mode == ImGuiFileDialog::Mode::OpenFile)
                 {
-                    run_open();
+                    open_file_in_tab(result.path.string());
                 }
                 else if (result.mode == ImGuiFileDialog::Mode::SaveFile)
                 {
+                    at->file_path = result.path.string();
                     run_save();
                 }
             }
@@ -1901,10 +2217,10 @@ int main(int argc, char** argv)
             std::lock_guard<std::mutex> lock(command_state->mutex);
             return command_state->running;
         }();
-        const std::string current_text = editor.GetText();
-        if (current_text != last_seen_text)
+        const std::string current_text = at->editor.GetText();
+        if (current_text != at->last_seen_text)
         {
-            outline.symbols = ScanDocumentSymbols(current_text);
+            at->outline_symbols = ScanDocumentSymbols(current_text);
         }
         if (command_running)
         {
@@ -1919,10 +2235,64 @@ int main(int argc, char** argv)
             ? output_panel_height + (ImGui::GetFrameHeightWithSpacing() * 5.0f)
             : ImGui::GetFrameHeightWithSpacing() * 2.0f;
         const bool parent_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
+        const float full_region_height = std::max(120.0f, ImGui::GetContentRegionAvail().y - footer_height);
+
+        // ── File Explorer (left side, full height including tabs) ──
+        if (file_explorer.visible)
+        {
+            file_explorer.width = std::clamp(file_explorer.width, 140.0f, std::max(180.0f, ImGui::GetContentRegionAvail().x - 400.0f));
+            ImGuiFileExplorer::Render("##file_explorer", file_explorer.root,
+                                      file_explorer.width, full_region_height,
+                                      at->file_path,
+                                      [&](const std::string& path) { open_file_in_tab(path); });
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGuiSplitter::Vertical("explorer_splitter", &file_explorer.width, 140.0f, 260.0f, full_region_height);
+            ImGui::SameLine(0.0f, 0.0f);
+        }
+
+        // ── Right side group: tabs + editor + outline ──
+        ImGui::BeginGroup();
+
+        // ── Tab bar ──
+        if (ImGui::BeginTabBar("##tabs", ImGuiTabBarFlags_Reorderable | ImGuiTabBarFlags_AutoSelectNewTabs | ImGuiTabBarFlags_FittingPolicyScroll))
+        {
+            for (int i = 0; i < static_cast<int>(tabs.size()); ++i)
+            {
+                ImGuiTabItemFlags tab_flags = 0;
+                if (switch_to_tab == i)
+                {
+                    tab_flags |= ImGuiTabItemFlags_SetSelected;
+                }
+                bool tab_open = true;
+                const std::string tab_label = tabs[i]->GetDisplayTitle() + "###tab" + std::to_string(i);
+                if (ImGui::BeginTabItem(tab_label.c_str(), &tab_open, tab_flags))
+                {
+                    if (active_tab_index != i)
+                    {
+                        active_tab_index = i;
+                        at = tabs[i].get();
+                    }
+                    ImGui::EndTabItem();
+                }
+                if (!tab_open)
+                {
+                    close_tab(i);
+                    if (i <= active_tab_index && active_tab_index > 0)
+                    {
+                        --active_tab_index;
+                    }
+                    at = tabs.empty() ? nullptr : tabs[active_tab_index].get();
+                    --i;
+                }
+            }
+            switch_to_tab = -1;
+            ImGui::EndTabBar();
+        }
+
         const float editor_region_height = std::max(80.0f, ImGui::GetContentRegionAvail().y - footer_height);
         int cursor_line = 0;
         int cursor_column = 0;
-        editor.GetCursorPosition(cursor_line, cursor_column);
+        at->editor.GetCursorPosition(cursor_line, cursor_column);
         const auto select_symbol_block = [&](const DocumentSymbol& symbol)
         {
             TextEditor::SelectionPosition selection;
@@ -1930,11 +2300,11 @@ int main(int argc, char** argv)
             selection.start.column = 0;
             selection.end.line = symbol.end_line;
             selection.end.column = std::numeric_limits<int>::max();
-            editor.SetSelectionPosition(selection);
-            editor.SetViewAtLine(symbol.line, TextEditor::SetViewAtLineMode::Centered);
+            at->editor.SetSelectionPosition(selection);
+            at->editor.SetViewAtLine(symbol.line, TextEditor::SetViewAtLineMode::Centered);
             status = "Selected " + symbol.name;
         };
-        const DocumentSymbol* active_symbol = FindInnermostSymbolAtLine(outline.symbols, cursor_line);
+        const DocumentSymbol* active_symbol = FindInnermostSymbolAtLine(at->outline_symbols, cursor_line);
 
         const auto render_outline_panel = [&]()
         {
@@ -1983,7 +2353,7 @@ int main(int argc, char** argv)
                     }
                 }
             };
-            render_symbols(render_symbols, outline.symbols);
+            render_symbols(render_symbols, at->outline_symbols);
             ImGui::EndChild();
         };
 
@@ -2000,12 +2370,33 @@ int main(int argc, char** argv)
             ImGui::SameLine(0.0f, 0.0f);
         }
 
-        const float editor_width = (outline.visible && outline.side == OutlineSide::Right)
-            ? std::max(80.0f, ImGui::GetContentRegionAvail().x - outline.width - 6.0f)
-            : -1.0f;
+        float editor_width = -1.0f;
+        {
+            float taken = 0.0f;
+            if (outline.visible && outline.side == OutlineSide::Right)
+            {
+                taken += outline.width + 6.0f;
+            }
+            if (minimap.visible)
+            {
+                taken += minimap.width + 6.0f;
+            }
+            if (taken > 0.0f)
+            {
+                editor_width = std::max(80.0f, ImGui::GetContentRegionAvail().x - taken);
+            }
+        }
+
         ImGui::PushFont(selected_font());
-        editor.Render("##source", parent_focused, ImVec2(editor_width, editor_region_height), false);
+        at->editor.Render("##source", parent_focused, ImVec2(editor_width, editor_region_height), false);
         ImGui::PopFont();
+
+        // ── Minimap ──
+        if (minimap.visible)
+        {
+            ImGui::SameLine(0.0f, 0.0f);
+            ImGuiMinimap::Render("##minimap", at->editor, minimap.width, editor_region_height, selected_font());
+        }
 
         if (outline.visible && outline.side == OutlineSide::Right)
         {
@@ -2015,32 +2406,50 @@ int main(int argc, char** argv)
             render_outline_panel();
         }
 
+        ImGui::EndGroup(); // end right-side group (tabs + editor + outline)
+
         if (ImGui::IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) && io.KeyCtrl && io.MouseWheel != 0.0f)
         {
             adjust_zoom(io.MouseWheel > 0.0f ? 0.1f : -0.1f);
         }
-        const bool dirty = current_text != last_saved_text;
-        if (current_text != last_seen_text)
+        const bool dirty = at->IsDirty();
+        if (current_text != at->last_seen_text)
         {
-            last_edit_ticks = SDL_GetTicks();
-            last_seen_text = current_text;
+            at->last_edit_ticks = SDL_GetTicks();
+            at->last_seen_text = current_text;
         }
 
-        if (settings.autosave_enabled && dirty)
+        // Autosave for all dirty tabs
+        if (settings.autosave_enabled)
         {
             const Uint32 now = SDL_GetTicks();
-            if (now - last_autosave_ticks >= static_cast<Uint32>(settings.autosave_interval_ms) &&
-                now - last_edit_ticks >= static_cast<Uint32>(settings.autosave_interval_ms))
+            for (int i = 0; i < static_cast<int>(tabs.size()); ++i)
             {
-                run_save();
-                status = "Autosaved";
+                auto& tab = *tabs[i];
+                if (!tab.IsDirty() || tab.file_path.empty()) continue;
+                if (now - tab.last_autosave_ticks >= static_cast<Uint32>(settings.autosave_interval_ms) &&
+                    now - tab.last_edit_ticks >= static_cast<Uint32>(settings.autosave_interval_ms))
+                {
+                    // Save this tab
+                    const std::string resolved_path = ResolveWritablePath(tab.file_path, executable_dir);
+                    const std::string tab_text = tab.editor.GetText();
+                    std::string save_status;
+                    if (SaveTextFile(resolved_path, tab_text, save_status))
+                    {
+                        tab.file_path = resolved_path;
+                        tab.last_saved_text = tab_text;
+                        tab.last_seen_text = tab_text;
+                        tab.last_autosave_ticks = now;
+                    }
+                    if (i == active_tab_index) status = "Autosaved";
+                }
             }
         }
         const char* theme_name =
-            editor.GetPalette() == TextEditor::PaletteId::VsCodeDark ? "VSCode Dark" :
-            editor.GetPalette() == TextEditor::PaletteId::Mariana ? "Mariana" :
-            editor.GetPalette() == TextEditor::PaletteId::Light ? "Light" :
-            editor.GetPalette() == TextEditor::PaletteId::RetroBlue ? "Retro Blue" : "Dark";
+            at->editor.GetPalette() == TextEditor::PaletteId::VsCodeDark ? "VSCode Dark" :
+            at->editor.GetPalette() == TextEditor::PaletteId::Mariana ? "Mariana" :
+            at->editor.GetPalette() == TextEditor::PaletteId::Light ? "Light" :
+            at->editor.GetPalette() == TextEditor::PaletteId::RetroBlue ? "Retro Blue" : "Dark";
         const std::string font_name = selected_font_name();
         const char* gif_state = gif_recorder.IsRecording() ? "REC" : "Off";
 
@@ -2072,15 +2481,131 @@ int main(int argc, char** argv)
             }
         }
 
+        // ── Snippet popup ──
+        if (snippet_popup.visible)
+        {
+            ImGui::OpenPopup("Snippets");
+            snippet_popup.visible = false;
+        }
+        if (ImGui::BeginPopupModal("Snippets", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            if (snippet_popup.focus_filter)
+            {
+                ImGui::SetKeyboardFocusHere();
+            }
+            ImGui::SetNextItemWidth(300.0f);
+            ImGui::InputTextWithHint("##snippet_filter", "Filter snippets...", &snippet_popup.filter);
+            if (snippet_popup.focus_filter)
+            {
+                snippet_popup.focus_filter = false;
+            }
+
+            const std::string sfilter = ToLowerCopy(snippet_popup.filter);
+            ImGui::BeginChild("##snippet_list", ImVec2(400.0f, 280.0f), true);
+            for (const auto& snippet : SnippetManager::GetSnippets())
+            {
+                if (!sfilter.empty() &&
+                    ToLowerCopy(snippet.name).find(sfilter) == std::string::npos &&
+                    ToLowerCopy(snippet.description).find(sfilter) == std::string::npos)
+                {
+                    continue;
+                }
+                const std::string label = snippet.name + " - " + snippet.description;
+                if (ImGui::Selectable(label.c_str()))
+                {
+                    insert_snippet(snippet);
+                    ImGui::CloseCurrentPopup();
+                }
+            }
+            ImGui::EndChild();
+
+            if (ImGui::Button("Close##snippets"))
+            {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        // ── Unsaved changes dialog ──
+        if (unsaved_close.visible)
+        {
+            ImGui::OpenPopup("Unsaved Changes");
+            unsaved_close.visible = false;
+        }
+        if (ImGui::BeginPopupModal("Unsaved Changes", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        {
+            const std::string msg = unsaved_close.closing_app
+                ? "There are unsaved changes. Discard all and quit?"
+                : "This tab has unsaved changes. Discard and close?";
+            ImGui::TextUnformatted(msg.c_str());
+            ImGui::Spacing();
+
+            if (ImGui::Button("Save & Close", ImVec2(120.0f, 0.0f)))
+            {
+                if (unsaved_close.closing_app)
+                {
+                    for (auto& tab : tabs)
+                    {
+                        if (tab->IsDirty() && !tab->file_path.empty())
+                        {
+                            const std::string rp = ResolveWritablePath(tab->file_path, executable_dir);
+                            std::string ss;
+                            SaveTextFile(rp, tab->editor.GetText(), ss);
+                        }
+                    }
+                    done = true;
+                }
+                else if (unsaved_close.tab_index >= 0 && unsaved_close.tab_index < static_cast<int>(tabs.size()))
+                {
+                    auto& tab = *tabs[unsaved_close.tab_index];
+                    if (!tab.file_path.empty())
+                    {
+                        // Temporarily switch context to save
+                        int old_active = active_tab_index;
+                        active_tab_index = unsaved_close.tab_index;
+                        at = tabs[active_tab_index].get();
+                        run_save();
+                        active_tab_index = old_active;
+                        at = tabs[std::min(active_tab_index, static_cast<int>(tabs.size()) - 1)].get();
+                    }
+                    force_close_tab(unsaved_close.tab_index);
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Discard", ImVec2(120.0f, 0.0f)))
+            {
+                if (unsaved_close.closing_app)
+                {
+                    done = true;
+                }
+                else
+                {
+                    force_close_tab(unsaved_close.tab_index);
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)))
+            {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
         ImGui::Separator();
-        ImGui::Text("BuLang | Theme: %s | Font: %s | Zoom: %d%% | Autosave: %s | GIF: %s | Tool: %s | Lines: %d | Cursor: %d:%d | %s | Status: %s",
+
+        // Tab count indicator
+        const int tab_count = static_cast<int>(tabs.size());
+        ImGui::Text("BuLang | Tabs: %d | Theme: %s | Font: %s | Zoom: %d%% | Autosave: %s | GIF: %s | Tool: %s | Lines: %d | Cursor: %d:%d | %s | Status: %s",
+                    tab_count,
                     theme_name,
                     font_name.c_str(),
-                    static_cast<int>(editor.GetFontScale() * 100.0f),
+                    static_cast<int>(at->editor.GetFontScale() * 100.0f),
                     settings.autosave_enabled ? "On" : "Off",
                     gif_state,
                     command_running ? "Running" : "Idle",
-                    editor.GetLineCount(),
+                    at->editor.GetLineCount(),
                     cursor_line + 1,
                     cursor_column + 1,
                     dirty ? "Modified" : "Saved",
@@ -2100,7 +2625,7 @@ int main(int argc, char** argv)
             gif_recorder.CaptureFrame(display_w, display_h, status);
         }
         SDL_GL_SwapWindow(window);
-        UpdateWindowTitle(window, file_path, dirty, gif_recorder.IsRecording());
+        UpdateWindowTitle(window, at->file_path, dirty, gif_recorder.IsRecording());
     }
 
     if (gif_recorder.IsRecording())

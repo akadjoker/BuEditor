@@ -51,6 +51,10 @@ public:
 	const char* GetLanguageDefinitionName() const;
 	void SetTabSize(int aValue);
 	inline int GetTabSize() const { return mTabSize; }
+
+	// Minimap support
+	int GetLineLengthRaw(int aLine) const;
+	ImU32 GetLineGlyphColor(int aLine, int aColumn) const;
 	void SetLineSpacing(float aValue);
 	inline float GetLineSpacing() const { return mLineSpacing;  }
 	void SetFontScale(float aValue);

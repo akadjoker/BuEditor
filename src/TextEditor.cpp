@@ -1050,18 +1050,47 @@ void TextEditor::EnterCharacter(ImWchar aChar, bool aShift)
 			InsertLine(coord.mLine + 1);
 			auto& line = mLines[coord.mLine];
 			auto& newLine = mLines[coord.mLine + 1];
+			auto cindex = GetCharacterIndexR(coord);
 
 			added.mText = "";
 			added.mText += (char)aChar;
 			if (mAutoIndent)
-				for (int i = 0; i < line.size() && isascii(line[i].mChar) && isblank(line[i].mChar); ++i)
+			{
+				for (int i = 0; i < (int)line.size() && isascii(line[i].mChar) && isblank(line[i].mChar); ++i)
 				{
 					newLine.push_back(line[i]);
 					added.mText += line[i].mChar;
 				}
 
+				// Smart indent: add extra indent after { or :
+				int lastNonSpace = -1;
+				for (int i = cindex - 1; i >= 0; --i)
+				{
+					if (!isascii(line[i].mChar) || !isblank(line[i].mChar))
+					{
+						lastNonSpace = i;
+						break;
+					}
+				}
+				if (lastNonSpace >= 0 && (line[lastNonSpace].mChar == '{' || line[lastNonSpace].mChar == ':'))
+				{
+					if (mShortTabs)
+					{
+						newLine.push_back(Glyph('\t', PaletteIndex::Default));
+						added.mText += '\t';
+					}
+					else
+					{
+						for (int t = 0; t < mTabSize; ++t)
+						{
+							newLine.push_back(Glyph(' ', PaletteIndex::Default));
+							added.mText += ' ';
+						}
+					}
+				}
+			}
+
 			const size_t whitespaceSize = newLine.size();
-			auto cindex = GetCharacterIndexR(coord);
 			AddGlyphsToLine(coord.mLine + 1, newLine.size(), line.begin() + cindex, line.end());
 			RemoveGlyphsFromLine(coord.mLine, cindex);
 			SetCursorPosition(Coordinates(coord.mLine + 1, GetCharacterColumn(coord.mLine + 1, (int)whitespaceSize)), c);
@@ -3064,3 +3093,17 @@ const std::unordered_map<char, char> TextEditor::CLOSE_TO_OPEN_CHAR = {
 };
 
 TextEditor::PaletteId TextEditor::defaultPalette = TextEditor::PaletteId::Dark;
+
+int TextEditor::GetLineLengthRaw(int aLine) const
+{
+	if (aLine < 0 || aLine >= (int)mLines.size()) return 0;
+	return (int)mLines[aLine].size();
+}
+
+ImU32 TextEditor::GetLineGlyphColor(int aLine, int aColumn) const
+{
+	if (aLine < 0 || aLine >= (int)mLines.size()) return IM_COL32(180, 180, 180, 255);
+	const auto& line = mLines[aLine];
+	if (aColumn < 0 || aColumn >= (int)line.size()) return IM_COL32(180, 180, 180, 255);
+	return GetGlyphColor(line[aColumn]);
+}

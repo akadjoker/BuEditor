@@ -2,13 +2,15 @@
   "autosave_enabled": true,
   "autosave_interval_ms": 1500,
   "bugl_path": "bin/bugl",
-  "bytecode_output_path": "scripts/vm_cheatsheet.buc",
+  "bytecode_output_path": "/media/ctw04578/data/projects/zen/BuEditor/scrips/sintax.buc",
   "console_visible": false,
-  "font_choice": "default",
-  "font_path": "",
-  "font_scale": 1.0,
-  "last_file_path": "scripts/vm_cheatsheet.bu",
-  "outline_side": "left",
+  "file_explorer_visible": true,
+  "font_choice": "custom",
+  "font_path": "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+  "font_scale": 1.100000023841858,
+  "last_file_path": "/media/ctw04578/data/projects/zen/BuEditor/scrips/sintax.bu",
+  "minimap_visible": false,
+  "outline_side": "right",
   "outline_visible": true,
   "palette": "vscode_dark",
   "runtime": {
@@ -16,8 +18,8 @@
     "profile_name": "bugl"
   },
   "workspace": {
-    "bytecode_output_path": "scripts/vm_cheatsheet.buc",
-    "entry_script": "scripts/vm_cheatsheet.bu",
+    "bytecode_output_path": "/media/ctw04578/data/projects/zen/BuEditor/scrips/sintax.buc",
+    "entry_script": "/media/ctw04578/data/projects/zen/BuEditor/scrips/sintax.bu",
     "root_path": ""
   }
 }
