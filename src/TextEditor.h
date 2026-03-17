@@ -52,9 +52,29 @@ public:
 	void SetTabSize(int aValue);
 	inline int GetTabSize() const { return mTabSize; }
 
+	// Code formatting
+	void FormatBracesNewLine();    // Move { to new lines (Allman style)
+	void FormatIndentation();      // Reindent code by brace depth
+	void FormatAll();              // Both: braces + indentation
+
 	// Minimap support
 	int GetLineLengthRaw(int aLine) const;
 	ImU32 GetLineGlyphColor(int aLine, int aColumn) const;
+
+	// Code folding
+	void ToggleFoldAtLine(int aLine);
+	void FoldAll();
+	void UnfoldAll();
+	bool IsLineFolded(int aLine) const;
+	bool IsLineHidden(int aLine) const;
+	int GetFoldEndLine(int aLine) const;  // returns -1 if line is not a fold header
+	bool IsFoldHeader(int aLine) const;   // true if this line starts a fold region
+	void ScanFoldRegions();
+	void RebuildVisibleLines();           // rebuild visual-to-actual line mapping
+	int ActualLineToVisualLine(int aLine) const;
+	int GetTotalVisibleLines() const { return (int)mVisibleLineNumbers.size(); }
+	inline void SetFoldingEnabled(bool aValue) { mFoldingEnabled = aValue; if (!aValue) { UnfoldAll(); } }
+	inline bool IsFoldingEnabled() const { return mFoldingEnabled; }
 	void SetLineSpacing(float aValue);
 	inline float GetLineSpacing() const { return mLineSpacing;  }
 	void SetFontScale(float aValue);
@@ -114,6 +134,12 @@ public:
 	void SetSelectionPosition(const SelectionPosition& pos);
 	SelectionPosition GetSelectionPosition(int aCursor = -1) const;
 	TextPosition GetCursorPosition() const;
+
+	// Public wrappers for context menu actions
+	void ToggleComment() { ToggleLineComment(); }
+	void Indent() { ChangeCurrentLinesIndentation(true); }
+	void Unindent() { ChangeCurrentLinesIndentation(false); }
+	void AddNextOccurrence() { AddCursorForNextOccurrence(); }
 
 
 private:
@@ -456,6 +482,13 @@ private:
 	bool mCursorPositionChanged = false;
 	bool mCursorOnBracket = false;
 	Coordinates mMatchingBracketCoords;
+
+	// Code folding state
+	bool mFoldingEnabled = true;
+	std::unordered_map<int, int> mFoldRegions;     // fold_start_line -> fold_end_line
+	std::unordered_set<int> mFoldedLines;           // set of collapsed fold-header lines
+	bool mFoldRegionsDirty = true;
+	std::vector<int> mVisibleLineNumbers;           // visual index -> actual line number
 
 	int mColorRangeMin = 0;
 	int mColorRangeMax = 0;

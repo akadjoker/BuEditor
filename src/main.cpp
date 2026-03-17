@@ -1711,9 +1711,17 @@ int main(int argc, char** argv)
                     }
                     else if (event.key.keysym.sym == SDLK_f)
                     {
-                        find_replace.visible = true;
-                        find_replace.replace_visible = false;
-                        find_replace.focus_find_input = true;
+                        if ((event.key.keysym.mod & KMOD_SHIFT) != 0)
+                        {
+                            at->editor.FormatAll();
+                            status = "Code formatted";
+                        }
+                        else
+                        {
+                            find_replace.visible = true;
+                            find_replace.replace_visible = false;
+                            find_replace.focus_find_input = true;
+                        }
                     }
                     else if (event.key.keysym.sym == SDLK_h)
                     {
@@ -1757,6 +1765,34 @@ int main(int argc, char** argv)
                         settings.file_explorer_visible = file_explorer.visible;
                         SaveSettings(settings);
                         status = file_explorer.visible ? "Explorer shown" : "Explorer hidden";
+                    }
+                    else if (event.key.keysym.sym == SDLK_SLASH || event.key.keysym.sym == SDLK_KP_DIVIDE ||
+                             event.key.keysym.scancode == SDL_SCANCODE_SLASH)
+                    {
+                        at->editor.ToggleComment();
+                    }
+                    else if (event.key.keysym.sym == SDLK_LEFTBRACKET && (event.key.keysym.mod & KMOD_SHIFT) != 0)
+                    {
+                        if (at->editor.IsFoldingEnabled())
+                        {
+                            at->editor.FoldAll();
+                            status = "All regions folded";
+                        }
+                    }
+                    else if (event.key.keysym.sym == SDLK_RIGHTBRACKET && (event.key.keysym.mod & KMOD_SHIFT) != 0)
+                    {
+                        if (at->editor.IsFoldingEnabled())
+                        {
+                            at->editor.UnfoldAll();
+                            status = "All regions unfolded";
+                        }
+                    }
+                    else if (event.key.keysym.sym == SDLK_m)
+                    {
+                        minimap.visible = !minimap.visible;
+                        settings.minimap_visible = minimap.visible;
+                        SaveSettings(settings);
+                        status = minimap.visible ? "Minimap shown" : "Minimap hidden";
                     }
                 }
                 else if (event.key.keysym.sym == SDLK_F5)
@@ -1878,6 +1914,26 @@ int main(int argc, char** argv)
                 }
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("Format"))
+            {
+                if (ImGui::MenuItem("Format All", "Ctrl+Shift+F"))
+                {
+                    at->editor.FormatAll();
+                    status = "Code formatted";
+                }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Braces to New Line"))
+                {
+                    at->editor.FormatBracesNewLine();
+                    status = "Braces moved to new lines";
+                }
+                if (ImGui::MenuItem("Fix Indentation"))
+                {
+                    at->editor.FormatIndentation();
+                    status = "Indentation fixed";
+                }
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("Snippets"))
             {
                 for (const auto& snippet : SnippetManager::GetSnippets())
@@ -1951,7 +2007,7 @@ int main(int argc, char** argv)
                     settings.file_explorer_visible = file_explorer.visible;
                     SaveSettings(settings);
                 }
-                if (ImGui::MenuItem("Minimap", nullptr, minimap.visible))
+                if (ImGui::MenuItem("Minimap", "Ctrl+M", minimap.visible))
                 {
                     minimap.visible = !minimap.visible;
                     settings.minimap_visible = minimap.visible;
@@ -1967,6 +2023,25 @@ int main(int argc, char** argv)
                 if (ImGui::MenuItem(gif_recorder.IsRecording() ? "Stop GIF Recording" : "Record GIF", "F9"))
                 {
                     toggle_gif_recording();
+                }
+                ImGui::Separator();
+                // Code folding
+                if (ImGui::MenuItem("Code Folding", nullptr, at->editor.IsFoldingEnabled()))
+                {
+                    at->editor.SetFoldingEnabled(!at->editor.IsFoldingEnabled());
+                }
+                if (at->editor.IsFoldingEnabled())
+                {
+                    if (ImGui::MenuItem("Fold All", "Ctrl+Shift+["))
+                    {
+                        at->editor.FoldAll();
+                        status = "All regions folded";
+                    }
+                    if (ImGui::MenuItem("Unfold All", "Ctrl+Shift+]"))
+                    {
+                        at->editor.UnfoldAll();
+                        status = "All regions unfolded";
+                    }
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Outline", nullptr, outline.visible))
@@ -2389,6 +2464,131 @@ int main(int argc, char** argv)
 
         ImGui::PushFont(selected_font());
         at->editor.Render("##source", parent_focused, ImVec2(editor_width, editor_region_height), false);
+
+        // ── Right-click context menu ──
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByPopup) && ImGui::IsMouseReleased(ImGuiMouseButton_Right))
+            ImGui::OpenPopup("##editor_context");
+
+        if (ImGui::BeginPopup("##editor_context"))
+        {
+            if (ImGui::MenuItem("Cut", "Ctrl+X", false, at->editor.AnyCursorHasSelection()))
+            {
+                at->editor.Cut();
+            }
+            if (ImGui::MenuItem("Copy", "Ctrl+C", false, at->editor.AnyCursorHasSelection()))
+            {
+                at->editor.Copy();
+            }
+            if (ImGui::MenuItem("Paste", "Ctrl+V"))
+            {
+                at->editor.Paste();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Select All", "Ctrl+A"))
+            {
+                at->editor.SelectAll();
+            }
+            if (ImGui::MenuItem("Select Word", "Ctrl+D"))
+            {
+                at->editor.AddNextOccurrence();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Undo", "Ctrl+Z", false, at->editor.CanUndo()))
+            {
+                at->editor.Undo();
+            }
+            if (ImGui::MenuItem("Redo", "Ctrl+Y", false, at->editor.CanRedo()))
+            {
+                at->editor.Redo();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Find...", "Ctrl+F"))
+            {
+                find_replace.visible = true;
+                find_replace.replace_visible = false;
+                find_replace.focus_find_input = true;
+            }
+            if (ImGui::MenuItem("Replace...", "Ctrl+H"))
+            {
+                find_replace.visible = true;
+                find_replace.replace_visible = true;
+                find_replace.focus_find_input = true;
+            }
+            if (ImGui::MenuItem("Go To Line...", "Ctrl+G"))
+            {
+                go_to_line.visible = true;
+                go_to_line.focus_input = true;
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Toggle Comment", "Ctrl+/"))
+            {
+                at->editor.ToggleComment();
+            }
+            if (ImGui::MenuItem("Indent", "Ctrl+]"))
+            {
+                at->editor.Indent();
+            }
+            if (ImGui::MenuItem("Unindent", "Ctrl+["))
+            {
+                at->editor.Unindent();
+            }
+            ImGui::Separator();
+            if (ImGui::BeginMenu("Format"))
+            {
+                if (ImGui::MenuItem("Format All", "Ctrl+Shift+F"))
+                {
+                    at->editor.FormatAll();
+                    status = "Code formatted";
+                }
+                if (ImGui::MenuItem("Braces to New Line"))
+                {
+                    at->editor.FormatBracesNewLine();
+                    status = "Braces moved to new lines";
+                }
+                if (ImGui::MenuItem("Fix Indentation"))
+                {
+                    at->editor.FormatIndentation();
+                    status = "Indentation fixed";
+                }
+                ImGui::EndMenu();
+            }
+            if (at->editor.IsFoldingEnabled())
+            {
+                if (ImGui::BeginMenu("Folding"))
+                {
+                    if (ImGui::MenuItem("Fold All", "Ctrl+Shift+["))
+                    {
+                        at->editor.FoldAll();
+                        status = "All regions folded";
+                    }
+                    if (ImGui::MenuItem("Unfold All", "Ctrl+Shift+]"))
+                    {
+                        at->editor.UnfoldAll();
+                        status = "All regions unfolded";
+                    }
+                    ImGui::EndMenu();
+                }
+            }
+            if (ImGui::BeginMenu("Snippets"))
+            {
+                for (const auto& snippet : SnippetManager::GetSnippets())
+                {
+                    const std::string label = snippet.name + " - " + snippet.description;
+                    if (ImGui::MenuItem(label.c_str()))
+                    {
+                        insert_snippet(snippet);
+                    }
+                }
+                ImGui::EndMenu();
+            }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Run Script", "F5"))
+            {
+                run_script();
+            }
+            ImGui::EndPopup();
+        }
+
         ImGui::PopFont();
 
         // ── Minimap ──

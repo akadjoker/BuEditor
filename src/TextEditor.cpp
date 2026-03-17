@@ -36,6 +36,7 @@ TextEditor::TextEditor()
 	SetPalette(defaultPalette);
 	mLines.push_back(Line());
 	SetLanguageDefinition(LanguageDefinitionId::BuLang);
+	RebuildVisibleLines();
 }
 
 TextEditor::~TextEditor()
@@ -201,11 +202,15 @@ void TextEditor::SetCursorPosition(int aLine, int aCharIndex)
 
 int TextEditor::GetFirstVisibleLine()
 {
+	if (!mVisibleLineNumbers.empty() && mFirstVisibleLine < (int)mVisibleLineNumbers.size())
+		return mVisibleLineNumbers[mFirstVisibleLine];
 	return mFirstVisibleLine;
 }
 
 int TextEditor::GetLastVisibleLine()
 {
+	if (!mVisibleLineNumbers.empty() && mLastVisibleLine < (int)mVisibleLineNumbers.size())
+		return mVisibleLineNumbers[mLastVisibleLine];
 	return mLastVisibleLine;
 }
 
@@ -358,6 +363,8 @@ void TextEditor::SetText(const std::string& aText)
 	mUndoIndex = 0;
 
 	Colorize();
+	mFoldRegionsDirty = true;
+	mFoldedLines.clear();
 }
 
 std::string TextEditor::GetText() const
@@ -1062,7 +1069,7 @@ void TextEditor::EnterCharacter(ImWchar aChar, bool aShift)
 					added.mText += line[i].mChar;
 				}
 
-				// Smart indent: add extra indent after { or :
+				// Smart indent: add extra indent after { or : or block keywords
 				int lastNonSpace = -1;
 				for (int i = cindex - 1; i >= 0; --i)
 				{
@@ -1072,7 +1079,55 @@ void TextEditor::EnterCharacter(ImWchar aChar, bool aShift)
 						break;
 					}
 				}
+
+				// Check if line ends with a block keyword (without {)
+				bool shouldExtraIndent = false;
 				if (lastNonSpace >= 0 && (line[lastNonSpace].mChar == '{' || line[lastNonSpace].mChar == ':'))
+				{
+					shouldExtraIndent = true;
+				}
+				else if (lastNonSpace >= 0)
+				{
+					// Extract the last word on the line before cursor
+					// Check if the line starts with or contains block-opening keywords
+					// like: if(...), for(...), while(...), else, elif, def, class, process, try, catch, switch, foreach, do
+					static const char* blockKeywords[] = {
+						"if", "for", "while", "else", "elif", "def", "class", "process",
+						"try", "catch", "switch", "foreach", "do", nullptr
+					};
+					// Extract text of line up to cursor
+					std::string lineText;
+					lineText.reserve(cindex);
+					for (int i = 0; i < cindex; i++)
+						lineText.push_back(line[i].mChar);
+					// Trim trailing spaces
+					while (!lineText.empty() && (lineText.back() == ' ' || lineText.back() == '\t'))
+						lineText.pop_back();
+					// Check if line ends with ) after a keyword like if(...), for(...)
+					if (!lineText.empty() && lineText.back() == ')')
+					{
+						shouldExtraIndent = true;
+					}
+					else
+					{
+						// Check if last word is a standalone block keyword
+						// Find start of last word
+						int wordEnd = (int)lineText.size();
+						int wordStart = wordEnd;
+						while (wordStart > 0 && (isalnum((unsigned char)lineText[wordStart - 1]) || lineText[wordStart - 1] == '_'))
+							wordStart--;
+						std::string lastWord = lineText.substr(wordStart, wordEnd - wordStart);
+						for (const char** kw = blockKeywords; *kw; kw++)
+						{
+							if (lastWord == *kw)
+							{
+								shouldExtraIndent = true;
+								break;
+							}
+						}
+					}
+				}
+				if (shouldExtraIndent)
 				{
 					if (mShortTabs)
 					{
@@ -1246,7 +1301,15 @@ void TextEditor::AddCursorForNextOccurrence(bool aCaseSensitive)
 {
 	const Cursor& currentCursor = mState.mCursors[mState.GetLastAddedCursorIndex()];
 	if (currentCursor.GetSelectionStart() == currentCursor.GetSelectionEnd())
+	{
+		// No selection: select current word first
+		Coordinates cursorPos = currentCursor.mInteractiveEnd;
+		Coordinates wordStart = FindWordStart(cursorPos);
+		Coordinates wordEnd = FindWordEnd(cursorPos);
+		if (wordStart != wordEnd)
+			SetSelection(wordStart, wordEnd, mState.GetLastAddedCursorIndex());
 		return;
+	}
 
 	std::string selectionText = GetText(currentCursor.GetSelectionStart(), currentCursor.GetSelectionEnd());
 	Coordinates nextStart, nextEnd;
@@ -1725,8 +1788,22 @@ TextEditor::Coordinates TextEditor::ScreenPosToCoordinates(const ImVec2& aPositi
 	if (isOverLineNumber != nullptr)
 		*isOverLineNumber = local.x < mTextStart;
 
+	int visualLine = Max(0, (int)floor(local.y / mCharAdvance.y));
+	int actualLine;
+	if (!mVisibleLineNumbers.empty() && mFoldingEnabled)
+	{
+		if (visualLine < (int)mVisibleLineNumbers.size())
+			actualLine = mVisibleLineNumbers[visualLine];
+		else
+			actualLine = (int)mLines.size() - 1;
+	}
+	else
+	{
+		actualLine = visualLine;
+	}
+
 	Coordinates out = {
-		Max(0, (int)floor(local.y / mCharAdvance.y)),
+		actualLine,
 		Max(0, (int)floor((local.x - mTextStart) / mCharAdvance.x))
 	};
 	out.mColumn = Max(0, (int)floor((local.x - mTextStart + POS_TO_COORDS_COLUMN_OFFSET * mCharAdvance.x) / mCharAdvance.x));
@@ -1891,6 +1968,7 @@ TextEditor::Line& TextEditor::InsertLine(int aIndex)
 			SetCursorPosition({ mState.mCursors[c].mInteractiveEnd.mLine + 1, mState.mCursors[c].mInteractiveEnd.mColumn }, c);
 	}
 
+	mFoldRegionsDirty = true;
 	return result;
 }
 
@@ -1911,6 +1989,7 @@ void TextEditor::RemoveLine(int aIndex, const std::unordered_set<int>* aHandledC
 				SetCursorPosition({ mState.mCursors[c].mInteractiveEnd.mLine - 1, mState.mCursors[c].mInteractiveEnd.mColumn }, c);
 		}
 	}
+	mFoldRegionsDirty = true;
 }
 
 void TextEditor::RemoveLines(int aStart, int aEnd)
@@ -2267,10 +2346,32 @@ void TextEditor::HandleMouseInputs()
 				Coordinates cursorCoords = ScreenPosToCoordinates(ImGui::GetMousePos(), &isOverLineNumber);
 				if (isOverLineNumber)
 				{
-					Coordinates targetCursorPos = cursorCoords.mLine < mLines.size() - 1 ?
-						Coordinates{ cursorCoords.mLine + 1, 0 } :
-						Coordinates{ cursorCoords.mLine, GetLineMaxColumn(cursorCoords.mLine) };
-					SetSelection({ cursorCoords.mLine, 0 }, targetCursorPos, mState.mCurrentCursor);
+					// Check if click is on fold marker area
+					if (mFoldingEnabled && IsFoldHeader(cursorCoords.mLine))
+					{
+						ImVec2 origin = ImGui::GetCursorScreenPos();
+						float localX = ImGui::GetMousePos().x - origin.x + 3.0f + mScrollX;
+						// Fold marker is at the right edge of the gutter, before text start
+						float foldAreaStart = mTextStart - ImGui::GetTextLineHeightWithSpacing();
+						if (localX >= foldAreaStart && localX <= mTextStart)
+						{
+							ToggleFoldAtLine(cursorCoords.mLine);
+						}
+						else
+						{
+							Coordinates targetCursorPos = cursorCoords.mLine < mLines.size() - 1 ?
+								Coordinates{ cursorCoords.mLine + 1, 0 } :
+								Coordinates{ cursorCoords.mLine, GetLineMaxColumn(cursorCoords.mLine) };
+							SetSelection({ cursorCoords.mLine, 0 }, targetCursorPos, mState.mCurrentCursor);
+						}
+					}
+					else
+					{
+						Coordinates targetCursorPos = cursorCoords.mLine < mLines.size() - 1 ?
+							Coordinates{ cursorCoords.mLine + 1, 0 } :
+							Coordinates{ cursorCoords.mLine, GetLineMaxColumn(cursorCoords.mLine) };
+						SetSelection({ cursorCoords.mLine, 0 }, targetCursorPos, mState.mCurrentCursor);
+					}
 				}
 				else
 					SetCursorPosition(cursorCoords, mState.GetLastAddedCursorIndex());
@@ -2314,6 +2415,10 @@ void TextEditor::Render(bool aParentIsFocused)
 	// [Bundle:DelayedInit]
 	SetPalette(mPaletteId);
 
+	// Scan fold regions if dirty
+	if (mFoldRegionsDirty)
+		ScanFoldRegions();
+
 	/* Compute mCharAdvance regarding to scaled font size (Ctrl + mouse wheel)*/
 	const float fontWidth = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, "#", nullptr, nullptr).x;
 	const float fontHeight = ImGui::GetTextLineHeightWithSpacing();
@@ -2327,11 +2432,21 @@ void TextEditor::Render(bool aParentIsFocused)
 		snprintf(lineNumberBuffer, 16, " %zu ", mLines.size());
 		mTextStart += ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, lineNumberBuffer, nullptr, nullptr).x;
 	}
+	// Add space for fold markers in the gutter
+	float foldMarkerWidth = 0.0f;
+	if (mFoldingEnabled)
+	{
+		foldMarkerWidth = fontHeight;  // square area for fold icon
+		mTextStart += foldMarkerWidth;
+	}
 
 	ImVec2 cursorScreenPos = ImGui::GetCursorScreenPos();
 	mScrollX = ImGui::GetScrollX();
 	mScrollY = ImGui::GetScrollY();
 	UpdateViewVariables(mScrollX, mScrollY);
+
+	// Clamp visible line range to mVisibleLineNumbers size
+	int totalVisibleLines = (int)mVisibleLineNumbers.size();
 
 	int maxColumnLimited = 0;
 	if (!mLines.empty())
@@ -2339,9 +2454,10 @@ void TextEditor::Render(bool aParentIsFocused)
 		auto drawList = ImGui::GetWindowDrawList();
 		float spaceSize = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, " ", nullptr, nullptr).x;
 
-		for (int lineNo = mFirstVisibleLine; lineNo <= mLastVisibleLine && lineNo < mLines.size(); lineNo++)
+		for (int visualLine = mFirstVisibleLine; visualLine <= mLastVisibleLine && visualLine < totalVisibleLines; visualLine++)
 		{
-			ImVec2 lineStartScreenPos = ImVec2(cursorScreenPos.x, cursorScreenPos.y + lineNo * mCharAdvance.y);
+			int lineNo = mVisibleLineNumbers[visualLine];
+			ImVec2 lineStartScreenPos = ImVec2(cursorScreenPos.x, cursorScreenPos.y + visualLine * mCharAdvance.y);
 			ImVec2 textScreenPos = ImVec2(lineStartScreenPos.x + mTextStart, lineStartScreenPos.y);
 
 			auto& line = mLines[lineNo];
@@ -2349,6 +2465,40 @@ void TextEditor::Render(bool aParentIsFocused)
 
 			Coordinates lineStartCoord(lineNo, 0);
 			Coordinates lineEndCoord(lineNo, maxColumnLimited);
+
+			// Draw current line highlight
+			bool isCursorLine = false;
+			for (int c = 0; c <= mState.mCurrentCursor; c++)
+			{
+				if (mState.mCursors[c].mInteractiveEnd.mLine == lineNo)
+				{
+					isCursorLine = true;
+					break;
+				}
+			}
+			if (isCursorLine)
+			{
+				bool focused = ImGui::IsWindowFocused() || aParentIsFocused;
+				ImU32 fillColor = focused
+					? mPalette[(int)PaletteIndex::CurrentLineFill]
+					: mPalette[(int)PaletteIndex::CurrentLineFillInactive];
+				ImU32 edgeColor = mPalette[(int)PaletteIndex::CurrentLineEdge];
+
+				// Full-width background fill
+				ImVec2 fillStart(lineStartScreenPos.x, lineStartScreenPos.y);
+				ImVec2 fillEnd(lineStartScreenPos.x + mContentWidth + mScrollX, lineStartScreenPos.y + mCharAdvance.y);
+				drawList->AddRectFilled(fillStart, fillEnd, fillColor);
+
+				// Subtle top and bottom edge lines
+				drawList->AddLine(
+					ImVec2(lineStartScreenPos.x + mTextStart, lineStartScreenPos.y),
+					ImVec2(lineStartScreenPos.x + mContentWidth + mScrollX, lineStartScreenPos.y),
+					edgeColor, 1.0f);
+				drawList->AddLine(
+					ImVec2(lineStartScreenPos.x + mTextStart, lineStartScreenPos.y + mCharAdvance.y),
+					ImVec2(lineStartScreenPos.x + mContentWidth + mScrollX, lineStartScreenPos.y + mCharAdvance.y),
+					edgeColor, 1.0f);
+			}
 
 			// Draw selection for the current line
 			for (int c = 0; c <= mState.mCurrentCursor; c++)
@@ -2476,35 +2626,86 @@ void TextEditor::Render(bool aParentIsFocused)
 
 				MoveCharIndexAndColumn(lineNo, charIndex, column);
 			}
+
+			// Draw fold ellipsis indicator for collapsed lines
+			if (mFoldingEnabled && IsLineFolded(lineNo))
+			{
+				float ellipsisX = lineStartScreenPos.x + mTextStart + TextDistanceToLineStart({lineNo, GetLineMaxColumn(lineNo)});
+				ImVec2 ellipsisPos(ellipsisX + mCharAdvance.x * 0.5f, lineStartScreenPos.y);
+				ImU32 ellipsisColor = mPalette[(int)PaletteIndex::LineNumber];
+				// Draw a rounded rect with "..." text
+				float textW = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, "...", nullptr, nullptr).x;
+				drawList->AddRectFilled(
+					ImVec2(ellipsisPos.x, ellipsisPos.y + 2),
+					ImVec2(ellipsisPos.x + textW + 4, ellipsisPos.y + fontHeight - 2),
+					IM_COL32(80, 80, 80, 128), 3.0f);
+				drawList->AddText(ImVec2(ellipsisPos.x + 2, ellipsisPos.y), ellipsisColor, "...");
+			}
 		}
 
-		// Draw gutter (line numbers) at fixed screen position - immune to horizontal scroll
-		if (mShowLineNumbers)
+		// Draw gutter (line numbers + fold markers) at fixed screen position - immune to horizontal scroll
+		if (mShowLineNumbers || mFoldingEnabled)
 		{
 			float gutterX = cursorScreenPos.x + mScrollX; // compensate for scroll
 
 			// Background rect covers any code text that scrolled into the gutter area
 			float topY = cursorScreenPos.y + mFirstVisibleLine * mCharAdvance.y;
-			float bottomY = cursorScreenPos.y + std::min(mLastVisibleLine + 1, (int)mLines.size()) * mCharAdvance.y;
+			float bottomY = cursorScreenPos.y + std::min(mLastVisibleLine + 1, totalVisibleLines) * mCharAdvance.y;
 			drawList->AddRectFilled(
 				ImVec2(gutterX, topY),
 				ImVec2(gutterX + mTextStart, bottomY),
 				mPalette[(int)PaletteIndex::Background]);
 
-			// Draw line numbers right-aligned within the gutter
-			for (int lineNo = mFirstVisibleLine; lineNo <= mLastVisibleLine && lineNo < (int)mLines.size(); lineNo++)
+			// Draw line numbers and fold markers
+			for (int visualLine = mFirstVisibleLine; visualLine <= mLastVisibleLine && visualLine < totalVisibleLines; visualLine++)
 			{
-				float lineY = cursorScreenPos.y + lineNo * mCharAdvance.y;
-				snprintf(lineNumberBuffer, 16, "%d  ", lineNo + 1);
-				float lineNoWidth = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, lineNumberBuffer, nullptr, nullptr).x;
-				drawList->AddText(
-					ImVec2(gutterX + mTextStart - lineNoWidth, lineY),
-					mPalette[(int)PaletteIndex::LineNumber],
-					lineNumberBuffer);
+				int lineNo = mVisibleLineNumbers[visualLine];
+				float lineY = cursorScreenPos.y + visualLine * mCharAdvance.y;
+
+				// Draw line number (right-aligned before fold marker area)
+				if (mShowLineNumbers)
+				{
+					snprintf(lineNumberBuffer, 16, "%d  ", lineNo + 1);
+					float lineNoWidth = ImGui::GetFont()->CalcTextSizeA(ImGui::GetFontSize(), FLT_MAX, -1.0f, lineNumberBuffer, nullptr, nullptr).x;
+					float lineNumEndX = gutterX + mTextStart - foldMarkerWidth - lineNoWidth;
+					if (!mFoldingEnabled)
+						lineNumEndX = gutterX + mTextStart - lineNoWidth;
+					drawList->AddText(
+						ImVec2(lineNumEndX, lineY),
+						mPalette[(int)PaletteIndex::LineNumber],
+						lineNumberBuffer);
+				}
+
+				// Draw fold marker
+				if (mFoldingEnabled && IsFoldHeader(lineNo))
+				{
+					float markerX = gutterX + mTextStart - foldMarkerWidth;
+					float markerCenterX = markerX + foldMarkerWidth * 0.5f;
+					float markerCenterY = lineY + fontHeight * 0.5f;
+					float arrowSize = fontHeight * 0.2f;
+					ImU32 foldColor = mPalette[(int)PaletteIndex::LineNumber];
+
+					if (IsLineFolded(lineNo))
+					{
+						// Right arrow ▶ (collapsed)
+						ImVec2 p1(markerCenterX - arrowSize * 0.5f, markerCenterY - arrowSize);
+						ImVec2 p2(markerCenterX + arrowSize * 0.5f, markerCenterY);
+						ImVec2 p3(markerCenterX - arrowSize * 0.5f, markerCenterY + arrowSize);
+						drawList->AddTriangleFilled(p1, p2, p3, foldColor);
+					}
+					else
+					{
+						// Down arrow ▼ (expanded)
+						ImVec2 p1(markerCenterX - arrowSize, markerCenterY - arrowSize * 0.5f);
+						ImVec2 p2(markerCenterX + arrowSize, markerCenterY - arrowSize * 0.5f);
+						ImVec2 p3(markerCenterX, markerCenterY + arrowSize * 0.5f);
+						drawList->AddTriangleFilled(p1, p2, p3, foldColor);
+					}
+				}
 			}
 		}
 	}
-	mCurrentSpaceHeight = (mLines.size() + Min(mVisibleLineCount - 1, (int)mLines.size())) * mCharAdvance.y;
+	mCurrentSpaceHeight = (totalVisibleLines + Min(mVisibleLineCount - 1, totalVisibleLines)) * mCharAdvance.y;
 	mCurrentSpaceWidth = Max((maxColumnLimited + Min(mVisibleColumnCount - 1, maxColumnLimited)) * mCharAdvance.x, mCurrentSpaceWidth);
 
 	ImGui::SetCursorPos(ImVec2(0, 0));
@@ -2516,15 +2717,16 @@ void TextEditor::Render(bool aParentIsFocused)
 		{
 			if (i) UpdateViewVariables(mScrollX, mScrollY); // second pass depends on changes made in first pass
 			Coordinates targetCoords = GetSanitizedCursorCoordinates(mEnsureCursorVisible, i); // cursor selection end or start
-			if (targetCoords.mLine <= mFirstVisibleLine)
+			int targetVisualLine = ActualLineToVisualLine(targetCoords.mLine);
+			if (targetVisualLine <= mFirstVisibleLine)
 			{
-				float targetScroll = std::max(0.0f, (targetCoords.mLine - 0.5f) * mCharAdvance.y);
+				float targetScroll = std::max(0.0f, (targetVisualLine - 0.5f) * mCharAdvance.y);
 				if (targetScroll < mScrollY)
 					ImGui::SetScrollY(targetScroll);
 			}
-			if (targetCoords.mLine >= mLastVisibleLine)
+			if (targetVisualLine >= mLastVisibleLine)
 			{
-				float targetScroll = std::max(0.0f, (targetCoords.mLine + 1.5f) * mCharAdvance.y - mContentHeight);
+				float targetScroll = std::max(0.0f, (targetVisualLine + 1.5f) * mCharAdvance.y - mContentHeight);
 				if (targetScroll > mScrollY)
 					ImGui::SetScrollY(targetScroll);
 			}
@@ -2550,18 +2752,19 @@ void TextEditor::Render(bool aParentIsFocused)
 	}
 	if (mSetViewAtLine > -1)
 	{
+		int setViewVisualLine = ActualLineToVisualLine(mSetViewAtLine);
 		float targetScroll;
 		switch (mSetViewAtLineMode)
 		{
 		default:
 		case SetViewAtLineMode::FirstVisibleLine:
-			targetScroll = std::max(0.0f, (float)mSetViewAtLine * mCharAdvance.y);
+			targetScroll = std::max(0.0f, (float)setViewVisualLine * mCharAdvance.y);
 			break;
 		case SetViewAtLineMode::LastVisibleLine:
-			targetScroll = std::max(0.0f, (float)(mSetViewAtLine - (mLastVisibleLine - mFirstVisibleLine)) * mCharAdvance.y);
+			targetScroll = std::max(0.0f, (float)(setViewVisualLine - (mLastVisibleLine - mFirstVisibleLine)) * mCharAdvance.y);
 			break;
 		case SetViewAtLineMode::Centered:
-			targetScroll = std::max(0.0f, ((float)mSetViewAtLine - (float)(mLastVisibleLine - mFirstVisibleLine) * 0.5f) * mCharAdvance.y);
+			targetScroll = std::max(0.0f, ((float)setViewVisualLine - (float)(mLastVisibleLine - mFirstVisibleLine) * 0.5f) * mCharAdvance.y);
 			break;
 		}
 		ImGui::SetScrollY(targetScroll);
@@ -2959,9 +3162,9 @@ const TextEditor::Palette& TextEditor::GetDarkPalette()
 			0xffffff15, // ControlCharacter
 			0x0080f040, // Breakpoint
 			0x7a8394ff, // Line number
-			0x00000040, // Current line fill
-			0x80808040, // Current line fill (inactive)
-			0xa0a0a040, // Current line edge
+			0xffffff0a, // Current line fill
+			0xffffff06, // Current line fill (inactive)
+			0xffffff15, // Current line edge
 		} };
 	return p;
 }
@@ -2988,9 +3191,9 @@ const TextEditor::Palette& TextEditor::GetMarianaPalette()
 			0xffffff30, // ControlCharacter
 			0x0080f040, // Breakpoint
 			0xffffffb0, // Line number
-			0x4e5a6580, // Current line fill
-			0x4e5a6530, // Current line fill (inactive)
-			0x4e5a65b0, // Current line edge
+			0xffffff0a, // Current line fill
+			0xffffff06, // Current line fill (inactive)
+			0xffffff15, // Current line edge
 		} };
 	return p;
 }
@@ -3017,9 +3220,9 @@ const TextEditor::Palette& TextEditor::GetLightPalette()
 			0x90909090, // ControlCharacter
 			0x0080f080, // Breakpoint
 			0x005050ff, // Line number
-			0x00000040, // Current line fill
-			0x80808040, // Current line fill (inactive)
-			0x00000040, // Current line edge
+			0x0000000a, // Current line fill
+			0x00000006, // Current line fill (inactive)
+			0x00000015, // Current line edge
 		} };
 	return p;
 }
@@ -3045,9 +3248,9 @@ const TextEditor::Palette& TextEditor::GetRetroBluePalette()
 			0xff0000a0, // ErrorMarker
 			0x0080ff80, // Breakpoint
 			0x008080ff, // Line number
-			0x00000040, // Current line fill
-			0x80808040, // Current line fill (inactive)
-			0x00000040, // Current line edge
+			0xffffff0a, // Current line fill
+			0xffffff06, // Current line fill (inactive)
+			0xffffff15, // Current line edge
 		} };
 	return p;
 }
@@ -3074,9 +3277,9 @@ const TextEditor::Palette& TextEditor::GetVsCodeDarkPalette()
 			0xffffff18, // ControlCharacter
 			0x0080f040, // Breakpoint
 			0x858585ff, // Line number
-			0x2a2d2eff, // Current line fill
-			0x25252660, // Current line fill (inactive)
-			0x333333ff, // Current line edge
+			0xffffff0a, // Current line fill
+			0xffffff06, // Current line fill (inactive)
+			0xffffff15, // Current line edge
 		} };
 	return p;
 }
@@ -3093,6 +3296,302 @@ const std::unordered_map<char, char> TextEditor::CLOSE_TO_OPEN_CHAR = {
 };
 
 TextEditor::PaletteId TextEditor::defaultPalette = TextEditor::PaletteId::Dark;
+
+// ------------- Code Formatting ------------- //
+
+void TextEditor::FormatBracesNewLine()
+{
+	std::string text = GetText();
+	std::string result;
+	result.reserve(text.size() + text.size() / 10);
+
+	bool inString = false;
+	bool inSingleLineComment = false;
+	bool inBlockComment = false;
+	char stringDelim = 0;
+
+	for (size_t i = 0; i < text.size(); i++)
+	{
+		char ch = text[i];
+		char next = (i + 1 < text.size()) ? text[i + 1] : 0;
+
+		// Track string state
+		if (!inSingleLineComment && !inBlockComment)
+		{
+			if (inString)
+			{
+				result.push_back(ch);
+				if (ch == '\\') { if (next) { result.push_back(next); i++; } continue; }
+				if (ch == stringDelim) inString = false;
+				continue;
+			}
+			if (ch == '"' || ch == '\'') { inString = true; stringDelim = ch; result.push_back(ch); continue; }
+		}
+		// Track comment state
+		if (!inString && !inBlockComment && ch == '/' && next == '/') { inSingleLineComment = true; result.push_back(ch); continue; }
+		if (!inString && !inSingleLineComment && ch == '/' && next == '*') { inBlockComment = true; result.push_back(ch); continue; }
+		if (inSingleLineComment) { result.push_back(ch); if (ch == '\n') inSingleLineComment = false; continue; }
+		if (inBlockComment) { result.push_back(ch); if (ch == '*' && next == '/') { result.push_back(next); i++; inBlockComment = false; } continue; }
+
+		if (ch == '{')
+		{
+			// Move { to new line: trim trailing whitespace from result, add \n, then {
+			// But only if previous non-whitespace isn't a newline or another {
+			// Find last non-whitespace
+			size_t lastNonSpace = result.size();
+			while (lastNonSpace > 0 && (result[lastNonSpace - 1] == ' ' || result[lastNonSpace - 1] == '\t'))
+				lastNonSpace--;
+
+			if (lastNonSpace > 0 && result[lastNonSpace - 1] != '\n' && result[lastNonSpace - 1] != '{')
+			{
+				result.resize(lastNonSpace);
+				result.push_back('\n');
+			}
+			result.push_back('{');
+		}
+		else
+		{
+			result.push_back(ch);
+		}
+	}
+
+	SetText(result);
+}
+
+void TextEditor::FormatIndentation()
+{
+	std::string text = GetText();
+	std::string result;
+	result.reserve(text.size());
+
+	// Split by lines
+	std::vector<std::string> lines;
+	{
+		std::string currentLine;
+		for (char ch : text)
+		{
+			if (ch == '\n')
+			{
+				lines.push_back(currentLine);
+				currentLine.clear();
+			}
+			else if (ch != '\r')
+			{
+				currentLine.push_back(ch);
+			}
+		}
+		lines.push_back(currentLine);
+	}
+
+	std::string indentUnit;
+	if (mShortTabs)
+		indentUnit = "\t";
+	else
+		for (int i = 0; i < mTabSize; i++)
+			indentUnit += ' ';
+
+	int depth = 0;
+	for (size_t lineIdx = 0; lineIdx < lines.size(); lineIdx++)
+	{
+		// Strip leading whitespace
+		std::string stripped;
+		size_t start = 0;
+		while (start < lines[lineIdx].size() && (lines[lineIdx][start] == ' ' || lines[lineIdx][start] == '\t'))
+			start++;
+		stripped = lines[lineIdx].substr(start);
+
+		// Count braces in this line (outside strings/comments - simplified)
+		// If line starts with }, decrease depth before indenting
+		bool startsWithClose = !stripped.empty() && stripped[0] == '}';
+		if (startsWithClose && depth > 0)
+			depth--;
+
+		// Write indented line
+		for (int d = 0; d < depth; d++)
+			result += indentUnit;
+		result += stripped;
+
+		if (lineIdx < lines.size() - 1)
+			result += '\n';
+
+		// Count braces for next line depth
+		bool inStr = false;
+		char strDelim = 0;
+		bool inSlc = false;
+		bool inBlc = false;
+		for (size_t ci = 0; ci < stripped.size(); ci++)
+		{
+			char c = stripped[ci];
+			char nc = (ci + 1 < stripped.size()) ? stripped[ci + 1] : 0;
+
+			if (!inSlc && !inBlc)
+			{
+				if (inStr) { if (c == '\\') { ci++; continue; } if (c == strDelim) inStr = false; continue; }
+				if (c == '"' || c == '\'') { inStr = true; strDelim = c; continue; }
+			}
+			if (!inStr && !inBlc && c == '/' && nc == '/') break; // rest is comment
+			if (!inStr && !inSlc && c == '/' && nc == '*') { inBlc = true; ci++; continue; }
+			if (inBlc) { if (c == '*' && nc == '/') { inBlc = false; ci++; } continue; }
+
+			if (c == '{') depth++;
+			else if (c == '}')
+			{
+				// Skip the first } if line starts with it (already handled above)
+				if (ci == 0 && startsWithClose) continue;
+				if (depth > 0) depth--;
+			}
+		}
+	}
+
+	SetText(result);
+}
+
+void TextEditor::FormatAll()
+{
+	FormatBracesNewLine();
+	FormatIndentation();
+}
+
+// ------------- Code Folding ------------- //
+
+void TextEditor::ScanFoldRegions()
+{
+	mFoldRegions.clear();
+	if (!mFoldingEnabled)
+	{
+		mFoldRegionsDirty = false;
+		RebuildVisibleLines();
+		return;
+	}
+
+	// Match { with } using a stack, only for curly braces (primary fold markers)
+	std::vector<int> braceStack; // stack of line numbers where '{' was found
+	for (int i = 0; i < (int)mLines.size(); i++)
+	{
+		const auto& line = mLines[i];
+		for (int j = 0; j < (int)line.size(); j++)
+		{
+			char ch = line[j].mChar;
+			if (ch == '{')
+			{
+				braceStack.push_back(i);
+			}
+			else if (ch == '}')
+			{
+				if (!braceStack.empty())
+				{
+					int startLine = braceStack.back();
+					braceStack.pop_back();
+					// Only create fold region if it spans multiple lines
+					if (i > startLine)
+					{
+						mFoldRegions[startLine] = i;
+					}
+				}
+			}
+		}
+	}
+
+	// Remove any folded lines that are no longer valid fold headers
+	for (auto it = mFoldedLines.begin(); it != mFoldedLines.end(); )
+	{
+		if (mFoldRegions.find(*it) == mFoldRegions.end())
+			it = mFoldedLines.erase(it);
+		else
+			++it;
+	}
+
+	mFoldRegionsDirty = false;
+	RebuildVisibleLines();
+}
+
+void TextEditor::RebuildVisibleLines()
+{
+	mVisibleLineNumbers.clear();
+	mVisibleLineNumbers.reserve(mLines.size());
+	for (int i = 0; i < (int)mLines.size(); i++)
+	{
+		if (!IsLineHidden(i))
+			mVisibleLineNumbers.push_back(i);
+	}
+}
+
+void TextEditor::ToggleFoldAtLine(int aLine)
+{
+	if (mFoldRegions.find(aLine) == mFoldRegions.end())
+		return; // not a fold header
+
+	if (mFoldedLines.count(aLine))
+		mFoldedLines.erase(aLine);
+	else
+		mFoldedLines.insert(aLine);
+
+	RebuildVisibleLines();
+}
+
+void TextEditor::FoldAll()
+{
+	for (const auto& [startLine, endLine] : mFoldRegions)
+		mFoldedLines.insert(startLine);
+	RebuildVisibleLines();
+}
+
+void TextEditor::UnfoldAll()
+{
+	mFoldedLines.clear();
+	RebuildVisibleLines();
+}
+
+bool TextEditor::IsLineFolded(int aLine) const
+{
+	return mFoldedLines.count(aLine) > 0;
+}
+
+bool TextEditor::IsFoldHeader(int aLine) const
+{
+	return mFoldRegions.find(aLine) != mFoldRegions.end();
+}
+
+bool TextEditor::IsLineHidden(int aLine) const
+{
+	if (!mFoldingEnabled || mFoldedLines.empty())
+		return false;
+
+	// A line is hidden if it falls inside any collapsed fold region (but not the fold header itself)
+	for (int foldStart : mFoldedLines)
+	{
+		auto it = mFoldRegions.find(foldStart);
+		if (it != mFoldRegions.end())
+		{
+			int foldEnd = it->second;
+			if (aLine > foldStart && aLine <= foldEnd)
+				return true;
+		}
+	}
+	return false;
+}
+
+int TextEditor::GetFoldEndLine(int aLine) const
+{
+	auto it = mFoldRegions.find(aLine);
+	if (it != mFoldRegions.end())
+		return it->second;
+	return -1;
+}
+
+int TextEditor::ActualLineToVisualLine(int aLine) const
+{
+	// Binary search in mVisibleLineNumbers for the actual line
+	auto it = std::lower_bound(mVisibleLineNumbers.begin(), mVisibleLineNumbers.end(), aLine);
+	if (it != mVisibleLineNumbers.end() && *it == aLine)
+		return (int)(it - mVisibleLineNumbers.begin());
+	// If the line is hidden, return the visual line of the fold header
+	if (it != mVisibleLineNumbers.begin())
+		return (int)(it - mVisibleLineNumbers.begin()) - 1;
+	return 0;
+}
+
+// ------------- End Code Folding ------------- //
 
 int TextEditor::GetLineLengthRaw(int aLine) const
 {

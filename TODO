@@ -1,8 +1,6 @@
 Features Propostas (por prioridade)
 P0 — Essenciais para uso diário
-Tabs / Multi-ficheiro — Abrir vários .bu em tabs, trocar entre eles. Sem isto o editor é single-file, o que é muito limitante para projetos reais.
 
-File Explorer / Tree View — Painel lateral com árvore de ficheiros do projeto. Permite navegar e abrir ficheiros sem usar o diálogo de OS.
 
 Erros inline (Error Markers) — Quando o bugl reporta erros, parsear a saída e marcar as linhas com erro no editor (gutter vermelho + tooltip com a mensagem).
 
@@ -15,7 +13,7 @@ Autocomplete básico — Completar keywords BuLang, nomes de funções/classes d
 
 Hover/Tooltip em símbolos — Ao passar sobre uma função no outline ou no código, mostrar a assinatura e linha.
 
-Code Folding — Colapsar blocos (def, class, if, for, etc.) para navegar código longo.
+
 
 Bracket Matching — Highlight de parênteses/chavetas correspondentes.
 
@@ -30,20 +28,16 @@ Recent Files — Menu com ficheiros recentemente abertos (File > Recent).
 
 Configuração de runtime por projeto — Dentro do workspace, definir qual runtime usar, argumentos, variáveis de ambiente.
 
-Build profiles — "Run", "Debug", "Release" com flags diferentes para o bugl.
 
-Terminal integrado — Além da consola de output, um terminal interativo para input/output do script.
 
 P3 — Polish e Extras
-Minimap — Preview vertical compacto do código (estilo VSCode).
+
 
 Drag & Drop — Arrastar ficheiro .bu para o editor para abrir.
 
-Snippet system — Templates rápidos (class → gera esqueleto de classe, for → gera loop).
 
 Diff view — Comparar duas versões de um ficheiro lado a lado.
 
-Plugin/Widget system — Carregar widgets do diretório widgets dinamicamente.
 
 Export settings — Importar/exportar configurações entre máquinas.
 
