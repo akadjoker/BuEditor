@@ -1,4 +1,5 @@
 #include "DocumentSymbols.h"
+#include "DejaVuSansMono_embedded.h"
 #include "EditorTab.h"
 #include "GifRecorder.h"
 #include "ImGuiFileDialog.h"
@@ -993,8 +994,13 @@ int main(int argc, char** argv)
 
     const auto discovered_fonts = DiscoverEditorFonts(executable_dir, project_dir);
     std::vector<EditorFontEntry> editor_fonts;
-    ImFont* default_editor_font = io.Fonts->AddFontDefault();
-    editor_fonts.push_back({"default", "Default", default_editor_font});
+
+    // Embedded DejaVu Sans Mono as the default editor font
+    ImFontConfig embedded_cfg;
+    embedded_cfg.FontDataOwnedByAtlas = false; // we own the static data
+    ImFont* default_editor_font = io.Fonts->AddFontFromMemoryTTF(
+        (void*)DejaVuSansMono_ttf_data, DejaVuSansMono_ttf_size, 16.0f, &embedded_cfg);
+    editor_fonts.push_back({"default", "DejaVu Sans Mono (Built-in)", default_editor_font});
     ImFont* droid_sans_font = nullptr;
     const std::string droid_sans_path = ResolveExistingPath("vendor/recastnavigation/RecastDemo/Bin/DroidSans.ttf", executable_dir);
     if (FileExists(droid_sans_path))
